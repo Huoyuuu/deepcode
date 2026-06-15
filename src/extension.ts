@@ -9,9 +9,11 @@ import {
   SessionManager,
   getCompactPromptTokenThreshold,
   type LlmStreamProgress,
+  type PermissionScope,
   type SessionEntry,
   type SkillInfo,
   type UserPromptContent,
+  type UserToolPermission,
 } from "./session";
 import {
   resolveSettingsSources,
@@ -27,6 +29,19 @@ const DEFAULT_BASE_URL = "https://api.deepseek.com";
 type ReasoningMessageParams = {
   reasoning_content?: string;
 };
+
+const VALID_PERMISSION_SCOPES = new Set<PermissionScope>([
+  "read-in-cwd",
+  "read-out-cwd",
+  "write-in-cwd",
+  "write-out-cwd",
+  "delete-in-cwd",
+  "delete-out-cwd",
+  "query-git-log",
+  "mutate-git-log",
+  "network",
+  "mcp",
+]);
 
 class DeepcodingViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = "deepcode.chatView";
@@ -69,6 +84,7 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
           type: "sessionStatus",
           sessionId: entry.id,
           status: entry.status,
+          askPermissions: entry.askPermissions,
           processes: this.serializeProcesses(entry.processes),
           tokenTelemetry: this.buildTokenTelemetry(entry),
         });
@@ -114,15 +130,25 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
         const images = Array.isArray(message.images)
           ? message.images.filter((image: unknown): image is string => typeof image === "string" && image.length > 0)
           : [];
-        if (!prompt && images.length === 0) {
+        const permissions = parseUserToolPermissions(message.permissions);
+        const alwaysAllows = parsePermissionScopes(message.alwaysAllows);
+        if (!prompt && images.length === 0 && permissions.length === 0 && alwaysAllows.length === 0) {
           return;
         }
         // 获取 skills
         const skills = message.skills || [];
-        await this.handlePrompt(prompt, skills, images);
+        await this.handlePrompt(prompt, skills, images, {
+          permissions: permissions.length > 0 ? permissions : undefined,
+          alwaysAllows: alwaysAllows.length > 0 ? alwaysAllows : undefined,
+        });
       } else if (message?.type === "interrupt") {
         // 中断当前会话
         this.sessionManager.interruptActiveSession();
+      } else if (message?.type === "denyPermission") {
+        const sessionId = String(message.sessionId || this.sessionManager.getActiveSessionId() || "").trim();
+        if (sessionId) {
+          this.handlePermissionDenied(sessionId);
+        }
       } else if (message?.type === "createNewSession") {
         await this.createNewSession();
       } else if (message?.type === "selectSession") {
@@ -201,6 +227,7 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
       sessionId,
       summary: session.summary || "Untitled",
       status: session.status,
+      askPermissions: session.askPermissions,
       processes: this.serializeProcesses(session.processes),
       tokenTelemetry: this.buildTokenTelemetry(session),
       sessions: sessionsList,
@@ -272,7 +299,12 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
     this.sendMessage({ type: "skillsList", skills });
   }
 
-  private async handlePrompt(prompt: string, skills?: SkillInfo[], imageUrls?: string[]): Promise<void> {
+  private async handlePrompt(
+    prompt: string,
+    skills?: SkillInfo[],
+    imageUrls?: string[],
+    options: { permissions?: UserToolPermission[]; alwaysAllows?: PermissionScope[] } = {}
+  ): Promise<void> {
     if (!this.webviewView) {
       return;
     }
@@ -280,14 +312,26 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
     const webview = this.webviewView.webview;
     const normalizedImages = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [];
     const displayPrompt = prompt || (normalizedImages.length > 0 ? "粘贴的图像" : "");
+    const isPermissionContinue =
+      prompt === "/continue" &&
+      normalizedImages.length === 0 &&
+      ((options.permissions?.length ?? 0) > 0 || (options.alwaysAllows?.length ?? 0) > 0);
 
     // 先显示用户消息（原始文本，不做 HTML 格式化）
-    webview.postMessage({ type: "userMessage", content: displayPrompt });
+    if (displayPrompt && !isPermissionContinue) {
+      webview.postMessage({ type: "userMessage", content: displayPrompt });
+    }
 
     webview.postMessage({ type: "loading", value: true });
 
     try {
-      const userPrompt: UserPromptContent = { text: prompt, skills, imageUrls: normalizedImages };
+      const userPrompt: UserPromptContent = {
+        text: prompt,
+        skills,
+        imageUrls: normalizedImages,
+        permissions: options.permissions,
+        alwaysAllows: options.alwaysAllows,
+      };
       await this.sessionManager.handleUserPrompt(userPrompt);
       await this.sendSkillsList();
 
@@ -298,6 +342,7 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
           type: "sessionStatus",
           sessionId: activeSessionId,
           status: activeSession.status,
+          askPermissions: activeSession.askPermissions,
           processes: this.serializeProcesses(activeSession.processes),
           tokenTelemetry: this.buildTokenTelemetry(activeSession),
         });
@@ -325,6 +370,22 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
     } finally {
       webview.postMessage({ type: "loading", value: false });
     }
+  }
+
+  private handlePermissionDenied(sessionId: string): void {
+    this.sessionManager.denySessionPermission(sessionId);
+    const session = this.sessionManager.getSession(sessionId);
+    if (session) {
+      this.sendMessage({
+        type: "sessionStatus",
+        sessionId,
+        status: session.status,
+        askPermissions: session.askPermissions,
+        processes: this.serializeProcesses(session.processes),
+        tokenTelemetry: this.buildTokenTelemetry(session),
+      });
+    }
+    this.showSessionsList();
   }
 
   private createOpenAIClient(): {
@@ -519,6 +580,44 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
     editor.selection = selection;
     editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
   }
+}
+
+function parseUserToolPermissions(value: unknown): UserToolPermission[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const result: UserToolPermission[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const record = item as { toolCallId?: unknown; permission?: unknown };
+    if (typeof record.toolCallId !== "string" || !record.toolCallId.trim()) {
+      continue;
+    }
+    if (record.permission !== "allow" && record.permission !== "deny") {
+      continue;
+    }
+    result.push({ toolCallId: record.toolCallId, permission: record.permission });
+  }
+  return result;
+}
+
+function parsePermissionScopes(value: unknown): PermissionScope[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const result: PermissionScope[] = [];
+  for (const item of value) {
+    if (typeof item !== "string" || !VALID_PERMISSION_SCOPES.has(item as PermissionScope)) {
+      continue;
+    }
+    const scope = item as PermissionScope;
+    if (!result.includes(scope)) {
+      result.push(scope);
+    }
+  }
+  return result;
 }
 
 export function activate(context: vscode.ExtensionContext): void {

@@ -44,6 +44,7 @@
             <div class="skills-popup-header">Select Skills</div>
             <div class="skills-popup-list" id="skillsPopupList"></div>
           </div>
+          <div class="permission-prompt-host" id="permissionPromptHost" hidden></div>
           <div class="input-wrap">
             <div class="tools-line"></div>
             <textarea id="prompt" placeholder="Write a prompt..." rows="3"></textarea>
@@ -104,6 +105,7 @@
       const skillsPopup = document.getElementById("skillsPopup");
       const skillsPopupList = document.getElementById("skillsPopupList");
       const skillsTags = document.getElementById("skillsTags");
+      const permissionPromptHost = document.getElementById("permissionPromptHost");
       const contextMeter = document.getElementById("contextMeter");
       const contextMeterRing = document.getElementById("contextMeterRing");
       const contextMeterTooltip = document.getElementById("contextMeterTooltip");
@@ -146,6 +148,9 @@
       let loadingUpdateTimer = null; // 定时更新loading文本的计时器
       let currentLlmStreamProgress = null;
       let currentTokenTelemetry = null;
+      let currentAskPermissions = [];
+      let permissionPromptState = null;
+      let pendingPermissionReply = null;
 
       function isBusyStatus(status) {
         return status === "processing" || status === "pending";
@@ -916,6 +921,294 @@
         return div.innerHTML;
       }
 
+      function normalizeAskPermissions(value) {
+        if (!Array.isArray(value)) {
+          return [];
+        }
+        return value
+          .map((item) => {
+            if (!item || typeof item !== "object") {
+              return null;
+            }
+            const toolCallId = typeof item.toolCallId === "string" ? item.toolCallId : "";
+            const name = typeof item.name === "string" ? item.name : "Tool";
+            const command = typeof item.command === "string" ? item.command : "";
+            const description = typeof item.description === "string" ? item.description : "";
+            const scopes = Array.isArray(item.scopes)
+              ? item.scopes.filter((scope) => typeof scope === "string" && scope.length > 0)
+              : [];
+            if (!toolCallId) {
+              return null;
+            }
+            return {
+              toolCallId,
+              name,
+              command,
+              description,
+              scopes: scopes.length > 0 ? scopes : ["unknown"]
+            };
+          })
+          .filter(Boolean);
+      }
+
+      function buildPermissionScopePrompts(requests) {
+        const prompts = [];
+        requests.forEach((request) => {
+          const scopes = request.scopes && request.scopes.length > 0 ? request.scopes : ["unknown"];
+          scopes.forEach((scope) => {
+            prompts.push({ request, scope });
+          });
+        });
+        return prompts;
+      }
+
+      function isAlwaysAllowedScope(scope) {
+        return [
+          "read-in-cwd",
+          "read-out-cwd",
+          "write-in-cwd",
+          "write-out-cwd",
+          "delete-in-cwd",
+          "delete-out-cwd",
+          "query-git-log",
+          "mutate-git-log",
+          "network",
+          "mcp"
+        ].includes(scope);
+      }
+
+      function describePermissionScope(scope) {
+        switch (scope) {
+          case "read-in-cwd":
+            return "reads inside this workspace";
+          case "read-out-cwd":
+            return "reads outside this workspace";
+          case "write-in-cwd":
+            return "writes inside this workspace";
+          case "write-out-cwd":
+            return "writes outside this workspace";
+          case "delete-in-cwd":
+            return "deletes inside this workspace";
+          case "delete-out-cwd":
+            return "deletes outside this workspace";
+          case "query-git-log":
+            return "Git history queries";
+          case "mutate-git-log":
+            return "Git history changes";
+          case "network":
+            return "network access";
+          case "mcp":
+            return "MCP tool access";
+          default:
+            return "unknown access";
+        }
+      }
+
+      function getPermissionRiskClass(scope) {
+        switch (scope) {
+          case "read-in-cwd":
+          case "query-git-log":
+            return "risk-low";
+          case "read-out-cwd":
+          case "write-in-cwd":
+          case "network":
+          case "mcp":
+            return "risk-medium";
+          default:
+            return "risk-high";
+        }
+      }
+
+      function samePermissionRequests(left, right) {
+        return JSON.stringify(left || []) === JSON.stringify(right || []);
+      }
+
+      function ensurePermissionPromptState(requests) {
+        const normalizedRequests = normalizeAskPermissions(requests);
+        if (
+          permissionPromptState &&
+          samePermissionRequests(permissionPromptState.requests, normalizedRequests)
+        ) {
+          return permissionPromptState;
+        }
+        permissionPromptState = {
+          requests: normalizedRequests,
+          prompts: buildPermissionScopePrompts(normalizedRequests),
+          index: 0,
+          decisions: {},
+          alwaysAllows: [],
+          submitting: false
+        };
+        return permissionPromptState;
+      }
+
+      function findNextPermissionPromptIndex(state) {
+        let index = state.index;
+        while (index < state.prompts.length) {
+          const scope = state.prompts[index].scope;
+          if (isAlwaysAllowedScope(scope) && state.alwaysAllows.includes(scope)) {
+            index += 1;
+            continue;
+          }
+          return index;
+        }
+        return state.prompts.length;
+      }
+
+      function buildPermissionResult(state) {
+        const permissions = state.requests.map((request) => ({
+          toolCallId: request.toolCallId,
+          permission: state.decisions[request.toolCallId] === "deny" ? "deny" : "allow"
+        }));
+        return {
+          permissions,
+          alwaysAllows: state.alwaysAllows.slice(),
+          hasDeny: permissions.some((permission) => permission.permission === "deny")
+        };
+      }
+
+      function submitPermissionResult(result) {
+        permissionPromptState = null;
+        currentAskPermissions = [];
+        if (result.hasDeny) {
+          pendingPermissionReply = {
+            permissions: result.permissions,
+            alwaysAllows: result.alwaysAllows
+          };
+          currentSessionStatus = "permission_denied";
+          vscode.postMessage({
+            type: "denyPermission",
+            sessionId: currentSessionId
+          });
+          renderPermissionPrompt();
+          updateSendIconState();
+          return;
+        }
+
+        pendingPermissionReply = null;
+        renderPermissionPrompt();
+        sendUserPromptText("/continue", undefined, [], {
+          permissions: result.permissions,
+          alwaysAllows: result.alwaysAllows,
+          skipHistory: true
+        });
+      }
+
+      function commitPermissionDecision(kind) {
+        if (!permissionPromptState || permissionPromptState.submitting) {
+          return;
+        }
+        const state = permissionPromptState;
+        const promptIndex = findNextPermissionPromptIndex(state);
+        const prompt = state.prompts[promptIndex];
+        if (!prompt) {
+          state.submitting = true;
+          submitPermissionResult(buildPermissionResult(state));
+          return;
+        }
+
+        if (kind === "always" && isAlwaysAllowedScope(prompt.scope)) {
+          if (!state.alwaysAllows.includes(prompt.scope)) {
+            state.alwaysAllows.push(prompt.scope);
+          }
+          if (state.decisions[prompt.request.toolCallId] !== "deny") {
+            state.decisions[prompt.request.toolCallId] = "allow";
+          }
+        } else {
+          state.decisions[prompt.request.toolCallId] =
+            kind === "deny" ? "deny" : state.decisions[prompt.request.toolCallId] === "deny" ? "deny" : "allow";
+        }
+
+        state.index = promptIndex + 1;
+        renderPermissionPrompt();
+      }
+
+      function cancelPermissionPrompt() {
+        permissionPromptState = null;
+        currentAskPermissions = [];
+        currentSessionStatus = "interrupted";
+        pendingPermissionReply = null;
+        vscode.postMessage({ type: "interrupt" });
+        renderPermissionPrompt();
+        setLoading(false, currentSessionStatus);
+      }
+
+      function renderPermissionDeniedNotice() {
+        permissionPromptHost.innerHTML = `
+          <div class="permission-card permission-denied-card">
+            <div class="permission-title">Permission denied</div>
+            <div class="permission-description">Add a reply, then press Enter to continue with the denial.</div>
+          </div>
+        `;
+        permissionPromptHost.hidden = false;
+      }
+
+      function renderPermissionPrompt() {
+        if (!permissionPromptHost) {
+          return;
+        }
+        if (pendingPermissionReply && currentSessionStatus === "permission_denied") {
+          renderPermissionDeniedNotice();
+          return;
+        }
+        if (currentSessionStatus !== "ask_permission" || currentAskPermissions.length === 0) {
+          permissionPromptHost.innerHTML = "";
+          permissionPromptHost.hidden = true;
+          permissionPromptState = null;
+          return;
+        }
+
+        const state = ensurePermissionPromptState(currentAskPermissions);
+        const promptIndex = findNextPermissionPromptIndex(state);
+        const prompt = state.prompts[promptIndex];
+        if (!prompt) {
+          state.submitting = true;
+          submitPermissionResult(buildPermissionResult(state));
+          return;
+        }
+
+        const request = prompt.request;
+        const scopeDescription = describePermissionScope(prompt.scope);
+        const riskClass = getPermissionRiskClass(prompt.scope);
+        const canAlwaysAllow = isAlwaysAllowedScope(prompt.scope);
+
+        permissionPromptHost.innerHTML = "";
+        permissionPromptHost.hidden = false;
+
+        const card = document.createElement("div");
+        card.className = "permission-card";
+        card.innerHTML = `
+          <div class="permission-header">
+            <div>
+              <div class="permission-title">Permission required</div>
+              <div class="permission-progress">${promptIndex + 1}/${state.prompts.length}</div>
+            </div>
+            <button type="button" class="permission-close" title="Interrupt">×</button>
+          </div>
+          <div class="permission-tool">${escapeHtml(request.name)}</div>
+          <div class="permission-command">${escapeHtml(request.command || "(no command)")}</div>
+          ${request.description ? `<div class="permission-description">${escapeHtml(request.description)}</div>` : ""}
+          <div class="permission-scope ${riskClass}">${escapeHtml(scopeDescription)}</div>
+          <div class="permission-question">Do you want to proceed?</div>
+          <div class="permission-actions">
+            <button type="button" class="permission-action permission-allow">Yes</button>
+            ${
+              canAlwaysAllow
+                ? `<button type="button" class="permission-action permission-always">Yes, and always allow this scope</button>`
+                : ""
+            }
+            <button type="button" class="permission-action permission-deny">No</button>
+          </div>
+        `;
+
+        card.querySelector(".permission-close")?.addEventListener("click", cancelPermissionPrompt);
+        card.querySelector(".permission-allow")?.addEventListener("click", () => commitPermissionDecision("allow"));
+        card.querySelector(".permission-always")?.addEventListener("click", () => commitPermissionDecision("always"));
+        card.querySelector(".permission-deny")?.addEventListener("click", () => commitPermissionDecision("deny"));
+
+        permissionPromptHost.appendChild(card);
+      }
+
       function renderStructuredToolResult(toolData, container) {
         if (!toolData || toolData.ok !== true) {
           return false;
@@ -1375,6 +1668,7 @@
 
         updateSendIconState();
         updateAskUserQuestionInteractivity();
+        renderPermissionPrompt();
       }
 
       function updateSendIconState() {
@@ -1642,23 +1936,31 @@
       updateSendIconState();
       autoResizePrompt();
 
-      function sendUserPromptText(text, skills, imageUrls) {
+      function sendUserPromptText(text, skills, imageUrls, options = {}) {
         const trimmed = (text || "").trim();
         const normalizedImages = Array.isArray(imageUrls) ? imageUrls.filter(Boolean) : [];
-        if ((!trimmed && normalizedImages.length === 0) || sendButton.disabled) {
-          return;
+        const permissions = Array.isArray(options.permissions) ? options.permissions : undefined;
+        const alwaysAllows = Array.isArray(options.alwaysAllows) ? options.alwaysAllows : undefined;
+        const hasPermissionPayload = Boolean(
+          (permissions && permissions.length > 0) || (alwaysAllows && alwaysAllows.length > 0)
+        );
+        if ((!trimmed && normalizedImages.length === 0 && !hasPermissionPayload) || sendButton.disabled) {
+          return false;
         }
 
         historyCursor = -1;
         draftBeforeHistory = null;
-        pendingUserPrompt = trimmed || (normalizedImages.length > 0 ? "粘贴的图像" : "");
+        pendingUserPrompt = options.skipHistory ? null : trimmed || (normalizedImages.length > 0 ? "粘贴的图像" : "");
 
         vscode.postMessage({
           type: "userPrompt",
           prompt: trimmed,
           skills: skills && skills.length > 0 ? skills : undefined,
-          images: normalizedImages.length > 0 ? normalizedImages : undefined
+          images: normalizedImages.length > 0 ? normalizedImages : undefined,
+          permissions,
+          alwaysAllows
         });
+        return true;
       }
 
       function sendPrompt() {
@@ -1682,7 +1984,13 @@
         promptInput.value = "";
         vscode.setState({ promptText: "" });
         autoResizePrompt();
-        sendUserPromptText(text, selectedSkills, imageUrls);
+        const permissionReply = pendingPermissionReply;
+        const sent = sendUserPromptText(text, selectedSkills, imageUrls, permissionReply || {});
+        if (!sent) {
+          return;
+        }
+        pendingPermissionReply = null;
+        renderPermissionPrompt();
         // 清空已选择的技能
         selectedSkills = [];
         attachmentManager?.clear();
@@ -1822,6 +2130,9 @@
           }
           currentSessionId = null;
           currentSessionStatus = message.status || null;
+          currentAskPermissions = [];
+          permissionPromptState = null;
+          pendingPermissionReply = null;
           updateContextMeter(message.tokenTelemetry);
           attachmentManager?.clear();
           setLoading(false, currentSessionStatus);
@@ -1841,6 +2152,9 @@
           // 加载已有对话
           currentSessionId = message.sessionId;
           currentSessionStatus = message.status || null;
+          currentAskPermissions = normalizeAskPermissions(message.askPermissions);
+          permissionPromptState = null;
+          pendingPermissionReply = null;
           updateContextMeter(message.tokenTelemetry);
           if ('processes' in message) {
             currentRunningProcesses = message.processes;
@@ -1899,6 +2213,7 @@
           // 设置会话状态
           const isCurrentlyProcessing = isBusyStatus(currentSessionStatus);
           setLoading(isCurrentlyProcessing, currentSessionStatus);
+          renderPermissionPrompt();
 
           // 如果消息中包含sessions，更新下拉框
           if (message.sessions && Array.isArray(message.sessions)) {
@@ -1914,6 +2229,12 @@
             return;
           }
           const nextStatus = message.status || null;
+          if ('askPermissions' in message) {
+            currentAskPermissions = normalizeAskPermissions(message.askPermissions);
+            if (nextStatus !== "ask_permission") {
+              permissionPromptState = null;
+            }
+          }
           if ('processes' in message) {
             currentRunningProcesses = message.processes;
           }
@@ -1921,6 +2242,7 @@
             updateContextMeter(message.tokenTelemetry);
           }
           setLoading(isBusyStatus(nextStatus), nextStatus);
+          renderPermissionPrompt();
         } else if (message.type === "llmStreamProgress") {
           const progress = message.progress || null;
           if (!progress || !progress.requestId) {
