@@ -47,6 +47,7 @@ export type EnabledSkillsSettings = Record<string, boolean>;
 
 export type DeepcodingSettings = {
   env?: DeepcodingEnv;
+  headers?: Record<string, string | undefined>;
   model?: string;
   temperature?: number;
   thinkingEnabled?: boolean;
@@ -62,6 +63,7 @@ export type DeepcodingSettings = {
 
 export type ResolvedDeepcodingSettings = {
   env: Record<string, string>;
+  headers: Record<string, string>;
   apiKey?: string;
   baseURL: string;
   model: string;
@@ -230,6 +232,22 @@ function normalizeEnv(env: DeepcodingSettings["env"]): Record<string, string> {
   return result;
 }
 
+function normalizeHeaders(headers: unknown): Record<string, string> {
+  const result: Record<string, string> = {};
+  if (!headers || typeof headers !== "object" || Array.isArray(headers)) {
+    return result;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    const headerName = key.trim();
+    if (!headerName || typeof value !== "string") {
+      continue;
+    }
+    result[headerName] = value;
+  }
+  return result;
+}
+
 export function collectDeepcodeEnv(processEnv: SettingsProcessEnv = process.env): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [key, value] of Object.entries(processEnv)) {
@@ -322,6 +340,10 @@ export function resolveSettingsSources(
     ...projectEnv,
     ...systemEnv,
   };
+  const headers = {
+    ...normalizeHeaders(userSettings?.headers),
+    ...normalizeHeaders(projectSettings?.headers),
+  };
 
   const model =
     trimString(systemEnv.MODEL) ||
@@ -380,6 +402,7 @@ export function resolveSettingsSources(
 
   return {
     env,
+    headers,
     apiKey: trimString(env.API_KEY) || undefined,
     baseURL: trimString(env.BASE_URL) || defaults.baseURL,
     model,

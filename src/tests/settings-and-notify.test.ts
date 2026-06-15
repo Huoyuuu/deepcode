@@ -191,6 +191,36 @@ test("resolveSettingsSources applies user, project, and DEEPCODE environment pre
   assert.equal(resolved.env.WEBHOOK, "system-webhook");
 });
 
+test("resolveSettingsSources merges headers with project precedence", () => {
+  const resolved = resolveSettingsSources(
+    {
+      headers: {
+        "User-Agent": "user-agent",
+        "X-User": "1",
+        "X-Ignore": undefined,
+      },
+    },
+    {
+      headers: {
+        "User-Agent": "project-agent",
+        "X-Project": "2",
+        "X-Number": 123 as never,
+      },
+    },
+    {
+      model: "default-model",
+      baseURL: "https://default.example.com",
+    },
+    TEST_PROCESS_ENV
+  );
+
+  assert.deepEqual(resolved.headers, {
+    "User-Agent": "project-agent",
+    "X-User": "1",
+    "X-Project": "2",
+  });
+});
+
 test("resolveSettingsSources merges permission settings", () => {
   const resolved = resolveSettingsSources(
     {

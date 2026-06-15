@@ -13,6 +13,9 @@ Create `~/.deepcode/settings.json` with:
     "BASE_URL": "https://api.deepseek.com",
     "API_KEY": "sk-..."
   },
+  "headers": {
+    "User-Agent": "Mozilla/5.0 ..."
+  },
   "thinkingEnabled": true,
   "reasoningEffort": "max"
 }

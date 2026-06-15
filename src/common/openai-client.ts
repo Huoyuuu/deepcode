@@ -51,7 +51,7 @@ export function createOpenAIClient(projectRoot: string = process.cwd()): {
     };
   }
 
-  const cacheKey = `${settings.apiKey}::${settings.baseURL}`;
+  const cacheKey = `${settings.apiKey}::${settings.baseURL}::${JSON.stringify(settings.headers)}`;
   if (cachedOpenAI && cachedOpenAIKey === cacheKey) {
     return {
       client: cachedOpenAI,
@@ -72,6 +72,7 @@ export function createOpenAIClient(projectRoot: string = process.cwd()): {
   cachedOpenAI = new OpenAI({
     apiKey: settings.apiKey,
     baseURL: settings.baseURL || undefined,
+    defaultHeaders: settings.headers,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     fetch: (url: any, init: any) => undiciFetch(url, { ...init, dispatcher: keepAliveAgent }),
   });

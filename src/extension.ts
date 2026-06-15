@@ -424,6 +424,7 @@ class DeepcodingViewProvider implements vscode.WebviewViewProvider {
     const client = new OpenAI({
       apiKey,
       baseURL: baseURL || undefined,
+      defaultHeaders: settings.headers,
     });
 
     return {
