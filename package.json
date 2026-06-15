@@ -109,6 +109,7 @@
   },
   "dependencies": {
     "ejs": "^5.0.2",
+    "undici": "^7.25.0",
     "zod": "^4.4.3"
   },
   "lint-staged": {

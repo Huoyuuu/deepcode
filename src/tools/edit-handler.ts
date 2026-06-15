@@ -8,14 +8,13 @@ import {
   readTextFileWithMetadata,
   writeTextFile,
 } from "../common/file-utils";
-import { executeValidatedTool, semanticBoolean } from "../common/runtime";
+import { executeValidatedTool, semanticBoolean } from "../common/validate";
 import {
   createSnippet,
   getFileState,
   getSnippet,
   hasSnippetOutdatedFileVersion,
   isAbsoluteFilePath,
-  isFullFileView,
   normalizeFilePath,
   recordFileState,
 } from "../common/state";
@@ -23,8 +22,6 @@ import {
 const MAX_CANDIDATE_COUNT = 5;
 const REPLACE_ALL_MATCH_THRESHOLD = 5;
 const SHORT_REPLACE_ALL_LENGTH = 40;
-const MIN_FUZZY_SCORE = 0.8;
-const CLOSEST_MATCH_CONTEXT_LINES = 2;
 const OUTDATED_SNIPPET_NOT_FOUND_ERROR =
   "old_string was not found in this snippet scope. The file has changed since this snippet was created. Read the file again before editing.";
 
@@ -49,14 +46,6 @@ type MatchOccurrence = {
   endLine: number;
 };
 
-type ClosestMatch = {
-  text: string;
-  startLine: number;
-  endLine: number;
-  score: number;
-  strategy: "loose_escape" | "fuzzy_window";
-};
-
 type LooseEscapeMatch = MatchOccurrence & {
   text: string;
   score: number;
@@ -69,7 +58,7 @@ type CorrectedEditStrings = {
 
 const editSchema = z.strictObject({
   file_path: z.string().optional(),
-  snippet_id: z.string().optional(),
+  snippet_id: z.string().min(1, "snippet_id is required."),
   old_string: z.string(),
   new_string: z.string(),
   replace_all: semanticBoolean(false).optional(),
@@ -94,19 +83,19 @@ export async function handleEditTool(
     args,
     context,
     async (input) => {
-      const snippetId = input.snippet_id?.trim() ?? "";
-      const snippet = snippetId ? getSnippet(context.sessionId, snippetId) : null;
+      const snippetId = input.snippet_id.trim();
+      const snippet = getSnippet(context.sessionId, snippetId);
 
       let filePath = input.file_path?.trim() ?? "";
-      if (!filePath && !snippet) {
+      if (!snippet) {
         return {
           ok: false,
           name: "edit",
-          error: 'Missing required "file_path" string or "snippet_id" string.',
+          error: `Unknown snippet_id: ${snippetId}`,
         };
       }
 
-      if (!filePath && snippet) {
+      if (!filePath) {
         filePath = snippet.filePath;
       }
 
@@ -119,27 +108,11 @@ export async function handleEditTool(
         };
       }
 
-      if (snippetId && !snippet) {
-        return {
-          ok: false,
-          name: "edit",
-          error: `Unknown snippet_id: ${snippetId}`,
-        };
-      }
-
-      if (snippet && snippet.filePath !== filePath) {
+      if (snippet.filePath !== filePath) {
         return {
           ok: false,
           name: "edit",
           error: "snippet_id does not belong to the provided file_path.",
-        };
-      }
-
-      if (input.old_string === "") {
-        return {
-          ok: false,
-          name: "edit",
-          error: "old_string must not be empty.",
         };
       }
 
@@ -188,14 +161,6 @@ export async function handleEditTool(
         };
       }
 
-      if (!snippet && !isFullFileView(fileState)) {
-        return {
-          ok: false,
-          name: "edit",
-          error: "File was only partially read. Use snippet_id or read the full file before editing.",
-        };
-      }
-
       if (hasFileChangedSinceState(filePath, fileState)) {
         return {
           ok: false,
@@ -211,11 +176,40 @@ export async function handleEditTool(
         const newString = input.new_string;
         const replaceAll = input.replace_all ?? false;
         const lineIndex = buildLineIndex(raw);
-        const scope = buildSearchScope(filePath, raw, lineIndex, snippet ?? null);
-        let matches = findOccurrences(raw, oldString, scope);
-        let matchedVia: "exact" | "line_leading_tab_correction" | "loose_escape" | "llm_escape_correction" = "exact";
+        const scope = buildSearchScope(filePath, raw, lineIndex, snippet);
+        let matches: MatchOccurrence[] = [];
+        let matchedVia:
+          | "exact"
+          | "empty_file"
+          | "line_leading_tab_correction"
+          | "loose_escape"
+          | "llm_escape_correction" = "exact";
         let replacementOldString = oldString;
         let replacementNewString = newString;
+
+        if (oldString === "") {
+          if (raw !== "") {
+            return {
+              ok: false,
+              name: "edit",
+              error: "old_string must not be empty unless the file is empty.",
+              metadata: {
+                scope: formatScopeMetadata(scope),
+              },
+            };
+          }
+          matches = [
+            {
+              startOffset: 0,
+              endOffset: 0,
+              startLine: 1,
+              endLine: 1,
+            },
+          ];
+          matchedVia = "empty_file";
+        } else {
+          matches = findOccurrences(raw, oldString, scope);
+        }
 
         if (matches.length === 0) {
           const tabStrippedOldString = stripReadResultLineTabs(oldString);
@@ -270,19 +264,21 @@ export async function handleEditTool(
             };
           }
 
-          const closestMatch = findClosestMatch(raw, oldString, scope, lineIndex);
+          const notFoundReason = await inferOldStringNotFoundReasonWithLLM(
+            raw,
+            lineIndex,
+            scope,
+            oldString,
+            newString,
+            context
+          );
           return {
             ok: false,
             name: "edit",
-            error: "old_string not found in file.",
-            metadata: closestMatch
-              ? {
-                  scope: formatScopeMetadata(scope),
-                  closest_match: buildClosestMatchMetadata(context.sessionId, filePath, closestMatch),
-                }
-              : {
-                  scope: formatScopeMetadata(scope),
-                },
+            error: notFoundReason ? `old_string not found in file. ${notFoundReason}` : "old_string not found in file.",
+            metadata: {
+              scope: formatScopeMetadata(scope),
+            },
           };
         }
 
@@ -346,7 +342,7 @@ export async function handleEditTool(
             replaced_count: replacedCount,
             matched_via: matchedVia,
             cache_refreshed: true,
-            read_scope_type: snippet ? "snippet" : "full",
+            read_scope_type: snippet.scopeType,
             encoding: freshMetadata.encoding,
             line_endings: freshMetadata.lineEndings,
             diff_preview: diffPreview,
@@ -582,24 +578,6 @@ function buildCandidateMetadata(
   });
 }
 
-function buildClosestMatchMetadata(
-  sessionId: string,
-  filePath: string,
-  closestMatch: ClosestMatch
-): Record<string, unknown> {
-  const preview = formatWithLineNumbers(closestMatch.text.split(/\r?\n/), closestMatch.startLine);
-  const snippet = createSnippet(sessionId, filePath, closestMatch.startLine, closestMatch.endLine, preview);
-
-  return {
-    snippet_id: snippet?.id ?? null,
-    start_line: closestMatch.startLine,
-    end_line: closestMatch.endLine,
-    similarity: Number(closestMatch.score.toFixed(3)),
-    strategy: closestMatch.strategy,
-    preview,
-  };
-}
-
 function formatScopeMetadata(scope: SearchScope): Record<string, unknown> {
   return {
     file_path: scope.filePath,
@@ -617,84 +595,6 @@ function buildPreview(raw: string, startLine: number, endLine: number): string {
 
 function formatWithLineNumbers(lines: string[], startLine: number): string {
   return lines.map((line, index) => `${String(startLine + index).padStart(6, " ")}\t${line}`).join("\n");
-}
-
-function findClosestMatch(
-  raw: string,
-  oldString: string,
-  scope: SearchScope,
-  lineIndex: LineIndex
-): ClosestMatch | null {
-  const looseEscapeMatches = findLooseEscapeMatches(raw, oldString, scope);
-  if (looseEscapeMatches.length > 0) {
-    let bestLooseMatch: ClosestMatch | null = null;
-    for (const match of looseEscapeMatches) {
-      const candidate: ClosestMatch = {
-        text: match.text,
-        startLine: match.startLine,
-        endLine: match.endLine,
-        score: match.score,
-        strategy: "loose_escape",
-      };
-      if (!bestLooseMatch || candidate.score > bestLooseMatch.score) {
-        bestLooseMatch = candidate;
-      }
-    }
-
-    if (bestLooseMatch && bestLooseMatch.score >= MIN_FUZZY_SCORE) {
-      return expandClosestMatch(raw, lineIndex, scope, bestLooseMatch);
-    }
-  }
-
-  const targetLineCount = Math.max(1, oldString.split(/\r?\n/).length);
-  const windowSizes = Array.from(new Set([Math.max(1, targetLineCount - 1), targetLineCount, targetLineCount + 1]));
-  const normalizedTarget = normalizeLooseText(oldString);
-
-  let bestMatch: ClosestMatch | null = null;
-  for (let startLine = scope.startLine; startLine <= scope.endLine; startLine += 1) {
-    for (const windowSize of windowSizes) {
-      const endLine = startLine + windowSize - 1;
-      if (endLine > scope.endLine) {
-        continue;
-      }
-
-      const candidateText = sliceLines(raw, lineIndex, startLine, endLine);
-      const score = similarityScore(normalizedTarget, normalizeLooseText(candidateText));
-      if (score < MIN_FUZZY_SCORE) {
-        continue;
-      }
-
-      const candidate: ClosestMatch = {
-        text: candidateText,
-        startLine,
-        endLine,
-        score,
-        strategy: "fuzzy_window",
-      };
-
-      if (!bestMatch || candidate.score > bestMatch.score) {
-        bestMatch = candidate;
-      }
-    }
-  }
-
-  return bestMatch ? expandClosestMatch(raw, lineIndex, scope, bestMatch) : null;
-}
-
-function expandClosestMatch(
-  raw: string,
-  lineIndex: LineIndex,
-  scope: SearchScope,
-  closestMatch: ClosestMatch
-): ClosestMatch {
-  const startLine = clamp(closestMatch.startLine - CLOSEST_MATCH_CONTEXT_LINES, scope.startLine, scope.endLine);
-  const endLine = clamp(closestMatch.endLine + CLOSEST_MATCH_CONTEXT_LINES, startLine, scope.endLine);
-  return {
-    ...closestMatch,
-    text: sliceLines(raw, lineIndex, startLine, endLine),
-    startLine,
-    endLine,
-  };
 }
 
 function buildLooseEscapeRegex(source: string): RegExp | null {
@@ -726,6 +626,91 @@ function buildLooseEscapeRegex(source: string): RegExp | null {
   }
 
   return new RegExp(pattern, "g");
+}
+
+async function inferOldStringNotFoundReasonWithLLM(
+  raw: string,
+  lineIndex: LineIndex,
+  scope: SearchScope,
+  oldString: string,
+  newString: string,
+  context: ToolExecutionContext
+): Promise<string | null> {
+  const clientFactory = context.createOpenAIClient;
+  if (!clientFactory) {
+    return null;
+  }
+
+  const { client, model, baseURL, thinkingEnabled, reasoningEffort } = clientFactory();
+  if (!client) {
+    return null;
+  }
+
+  const contextLineLimit = Math.max(1, oldString.split(/\r?\n/).length);
+  const snippetText = raw.slice(scope.startOffset, scope.endOffset);
+  const contentBeforeSnippet = getLinesBeforeScope(lineIndex, scope, contextLineLimit);
+  const contentAfterSnippet = getLinesAfterScope(lineIndex, scope, contextLineLimit);
+
+  try {
+    const response = await client.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You diagnose failed file edits when old_string was not found. " +
+            "Return XML only using <response><reason>...</reason></response>. " +
+            "Be concise and specific. Explain the likely mismatch between old_string and the <snippet_text/> content. " +
+            "Do not suggest unrelated changes.",
+        },
+        {
+          role: "user",
+          content:
+            "<request>\n" +
+            `  <content_before_snippet><![CDATA[${contentBeforeSnippet}]]></content_before_snippet>\n` +
+            `  <snippet_text><![CDATA[${snippetText}]]></snippet_text>\n` +
+            `  <content_after_snippet><![CDATA[${contentAfterSnippet}]]></content_after_snippet>\n` +
+            `  <old_string><![CDATA[${oldString}]]></old_string>\n` +
+            `  <new_string><![CDATA[${newString}]]></new_string>\n` +
+            "</request>\n" +
+            "<output_format>\n" +
+            "  <response>\n" +
+            "    <reason><![CDATA[...]]></reason>\n" +
+            "  </response>\n" +
+            "</output_format>",
+        },
+      ],
+      ...buildThinkingRequestOptions(thinkingEnabled, baseURL, reasoningEffort),
+    });
+
+    return parseOldStringNotFoundReason(response.choices?.[0]?.message?.content ?? "");
+  } catch {
+    return null;
+  }
+}
+
+function getLinesBeforeScope(lineIndex: LineIndex, scope: SearchScope, lineLimit: number): string {
+  const startIndex = Math.max(0, scope.startLine - 1 - lineLimit);
+  const endIndex = Math.max(0, scope.startLine - 1);
+  return lineIndex.lines.slice(startIndex, endIndex).join("\n");
+}
+
+function getLinesAfterScope(lineIndex: LineIndex, scope: SearchScope, lineLimit: number): string {
+  const startIndex = Math.min(lineIndex.lines.length, scope.endLine);
+  const endIndex = Math.min(lineIndex.lines.length, startIndex + lineLimit);
+  return lineIndex.lines.slice(startIndex, endIndex).join("\n");
+}
+
+function parseOldStringNotFoundReason(content: string): string | null {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  const normalized = trimmed.replace(/```(?:xml)?\s*([\s\S]*?)```/i, "$1").trim();
+  const reasonMatch = normalized.match(/<reason>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([\s\S]*?))<\/reason>/i);
+  const reason = (reasonMatch?.[1] ?? reasonMatch?.[2])?.trim();
+  return reason || null;
 }
 
 async function correctEscapedStringsWithLLM(
@@ -879,10 +864,4 @@ function toBigrams(value: string): string[] {
     result.push(value.slice(index, index + 2));
   }
   return result;
-}
-
-function sliceLines(raw: string, lineIndex: LineIndex, startLine: number, endLine: number): string {
-  const startOffset = lineIndex.lineStarts[startLine];
-  const endOffset = lineIndex.lineStarts[endLine + 1];
-  return raw.slice(startOffset, endOffset);
 }

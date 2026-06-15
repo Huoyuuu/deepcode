@@ -13,9 +13,11 @@ export type CreateOpenAIClient = () => {
   client: OpenAI | null;
   model: string;
   baseURL?: string;
+  temperature?: number;
   thinkingEnabled: boolean;
   reasoningEffort?: ReasoningEffort;
   debugLogEnabled?: boolean;
+  telemetryEnabled?: boolean;
   notify?: string;
   webSearchTool?: string;
   env?: Record<string, string>;
@@ -40,6 +42,7 @@ export type ToolExecutionContext = {
   onProcessExit?: (processId: string | number) => void;
   onProcessStdout?: (processId: string | number, chunk: string) => void;
   onProcessTimeoutControl?: (processId: string | number, control: ProcessTimeoutControl | null) => void;
+  onBackgroundProcessComplete?: (completion: BackgroundProcessCompletion) => void;
   onBeforeFileMutation?: (filePath: string) => void;
   onAfterFileMutation?: (filePath: string) => void;
   bashTimeoutMs?: number;
@@ -51,9 +54,25 @@ export type ToolExecutionHooks = {
   onProcessExit?: (processId: string | number) => void;
   onProcessStdout?: (processId: string | number, chunk: string) => void;
   onProcessTimeoutControl?: (processId: string | number, control: ProcessTimeoutControl | null) => void;
+  onBackgroundProcessComplete?: (completion: BackgroundProcessCompletion) => void;
   onBeforeFileMutation?: (filePath: string) => void;
   onAfterFileMutation?: (filePath: string) => void;
   shouldStop?: () => boolean;
+};
+
+export type BackgroundProcessCompletion = {
+  taskId: string;
+  processId: number;
+  command: string;
+  outputPath: string;
+  ok: boolean;
+  exitCode: number | null;
+  signal: string | null;
+  error?: string;
+  cwd: string | null;
+  shellPath: string;
+  startedAtMs: number;
+  completedAtMs: number;
 };
 
 export type ProcessTimeoutInfo = {
@@ -229,6 +248,7 @@ export class ToolExecutor {
         onProcessExit: hooks?.onProcessExit,
         onProcessStdout: hooks?.onProcessStdout,
         onProcessTimeoutControl: hooks?.onProcessTimeoutControl,
+        onBackgroundProcessComplete: hooks?.onBackgroundProcessComplete,
         onBeforeFileMutation: hooks?.onBeforeFileMutation,
         onAfterFileMutation: hooks?.onAfterFileMutation,
       });

@@ -4,7 +4,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { setTimeout as delay } from "node:timers/promises";
-import type { ProcessTimeoutControl, ToolExecutionContext } from "../tools/executor";
+import type { BackgroundProcessCompletion, ProcessTimeoutControl, ToolExecutionContext } from "../tools/executor";
 import { handleBashTool } from "../tools/bash-handler";
 import { handleEditTool } from "../tools/edit-handler";
 import { handleReadTool } from "../tools/read-handler";
@@ -104,6 +104,117 @@ test("Bash timeout control can extend the active command deadline", async () => 
   assert.equal(result.metadata?.timeoutMs, 1000);
 });
 
+test("Bash can run commands in the background and report completion output", async () => {
+  const workspace = createTempWorkspace();
+  let completion: BackgroundProcessCompletion | null = null;
+  const starts: Array<string | number> = [];
+  const exits: Array<string | number> = [];
+  const startedAt = Date.now();
+
+  const result = await handleBashTool(
+    {
+      command: "printf 'start\\n'; sleep 0.2; printf 'done\\n'",
+      run_in_background: true,
+    },
+    createContext("bash-background", workspace, {
+      bashTimeoutMs: 10,
+      bashMinTimeoutMs: 1,
+      onProcessStart: (pid) => starts.push(pid),
+      onProcessExit: (pid) => exits.push(pid),
+      onBackgroundProcessComplete: (event) => {
+        completion = event;
+      },
+    })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(result.metadata?.runInBackground, true);
+  assert.equal(typeof result.metadata?.backgroundTaskId, "string");
+  assert.equal(typeof result.metadata?.outputPath, "string");
+  assert.equal(typeof result.metadata?.processId, "number");
+  const stopCommand =
+    process.platform === "win32"
+      ? `cmd.exe /c "taskkill /PID ${result.metadata.processId} /T /F"`
+      : `kill -- -${result.metadata.processId}`;
+  assert.equal(result.metadata?.stopCommand, stopCommand);
+  assert.match(result.output ?? "", /Stop it with:/);
+  assert.ok(Date.now() - startedAt < 500);
+  assert.equal(starts.length, 1);
+
+  await waitFor(() => completion !== null, 2000);
+
+  assert.ok(completion);
+  const done = completion as BackgroundProcessCompletion;
+  assert.equal(done.ok, true);
+  assert.equal(done.exitCode, 0);
+  assert.equal(exits.length, 1);
+  const outputPath = done.outputPath;
+  const output = fs.readFileSync(outputPath, "utf8");
+  assert.match(output, /start/);
+  assert.match(output, /done/);
+  assert.doesNotMatch(output, /__DEEPCODE_PWD__/);
+});
+
+test("Bash background completion reports failed exit codes", async () => {
+  const workspace = createTempWorkspace();
+  let completion: BackgroundProcessCompletion | null = null;
+
+  const result = await handleBashTool(
+    {
+      command: "printf 'bad\\n'; exit 7",
+      run_in_background: true,
+    },
+    createContext("bash-background-failure", workspace, {
+      onBackgroundProcessComplete: (event) => {
+        completion = event;
+      },
+    })
+  );
+
+  assert.equal(result.ok, true);
+  await waitFor(() => completion !== null, 2000);
+
+  assert.ok(completion);
+  const done = completion as BackgroundProcessCompletion;
+  assert.equal(done.ok, false);
+  assert.equal(done.exitCode, 7);
+  assert.match(done.error ?? "", /exit code 7/);
+  const output = fs.readFileSync(done.outputPath, "utf8");
+  assert.match(output, /bad/);
+});
+
+test("Bash removes a trailing ampersand when run_in_background is true", async () => {
+  const workspace = createTempWorkspace();
+  let startedCommand = "";
+  let completion: BackgroundProcessCompletion | null = null;
+
+  const result = await handleBashTool(
+    {
+      command: "printf 'trimmed\\n' &",
+      run_in_background: true,
+    },
+    createContext("bash-background-trailing-ampersand", workspace, {
+      onProcessStart: (_pid, command) => {
+        startedCommand = command;
+      },
+      onBackgroundProcessComplete: (event) => {
+        completion = event;
+      },
+    })
+  );
+
+  assert.equal(result.ok, true);
+  assert.equal(startedCommand, "printf 'trimmed\\n'");
+
+  await waitFor(() => completion !== null, 2000);
+
+  assert.ok(completion);
+  const done = completion as BackgroundProcessCompletion;
+  assert.equal(done.command, "printf 'trimmed\\n'");
+  assert.equal(done.ok, true);
+  assert.equal(fs.readFileSync(done.outputPath, "utf8"), "trimmed\n");
+});
+
 test("UpdatePlan accepts a markdown task list string", async () => {
   const workspace = createTempWorkspace();
   const plan = ["## Task List", "", "- [>] Inspect current behavior", "- [ ] Implement UpdatePlan"].join("\n");
@@ -167,17 +278,29 @@ test("Read returns snippet metadata and Edit can scope replacements by snippet_i
   );
 });
 
+test("Read returns full-file snippet ids with a semantic prefix", async () => {
+  const workspace = createTempWorkspace();
+  const filePath = path.join(workspace, "full.txt");
+  fs.writeFileSync(filePath, "alpha\nbeta\n", "utf8");
+
+  const firstSnippet = await readSnippet(filePath, "full-file-snippet", workspace);
+  const secondSnippet = await readSnippet(filePath, "full-file-snippet", workspace);
+
+  assert.equal(firstSnippet.id, "full_file_0");
+  assert.equal(secondSnippet.id, "full_file_1");
+});
+
 test("Edit returns candidate match snippets when old_string is not unique", async () => {
   const workspace = createTempWorkspace();
   const filePath = path.join(workspace, "duplicate.txt");
   fs.writeFileSync(filePath, ["city", "city", "salary"].join("\n"), "utf8");
 
   const sessionId = "candidate-matches";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   const editResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: "city",
       new_string: "location",
     },
@@ -198,7 +321,7 @@ test("Edit returns candidate match snippets when old_string is not unique", asyn
   assert.match(candidates[0]?.preview ?? "", /city/);
 });
 
-test("Edit returns closest matches only above threshold with surrounding context", async () => {
+test("Edit reports missing old_string without closest-match metadata when no LLM is configured", async () => {
   const workspace = createTempWorkspace();
   const filePath = path.join(workspace, "closest.ts");
   fs.writeFileSync(
@@ -214,11 +337,11 @@ test("Edit returns closest matches only above threshold with surrounding context
   );
 
   const sessionId = "closest-match-context";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const fullSnippet = await readSnippet(filePath, sessionId, workspace);
 
   const closeResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: fullSnippet.id,
       old_string: "function computeTotal(value: number) {",
       new_string: "function computeTotal(input: number) {",
     },
@@ -227,19 +350,11 @@ test("Edit returns closest matches only above threshold with surrounding context
 
   assert.equal(closeResult.ok, false);
   assert.equal(closeResult.error, "old_string not found in file.");
-  const closestMatch = closeResult.metadata?.closest_match as
-    | { snippet_id?: string; start_line?: number; end_line?: number; similarity?: number; preview?: string }
-    | undefined;
-  assert.ok(closestMatch?.snippet_id);
-  assert.equal(closestMatch.start_line, 1);
-  assert.equal(closestMatch.end_line, 4);
-  assert.ok((closestMatch.similarity ?? 0) >= 0.8);
-  assert.match(closestMatch.preview ?? "", /const before = true/);
-  assert.match(closestMatch.preview ?? "", /return value/);
+  assert.equal(closeResult.metadata?.closest_match, undefined);
 
   const lowResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: fullSnippet.id,
       old_string: 'query: string = Field(description="search query")',
       new_string: "query: string",
     },
@@ -267,12 +382,119 @@ test("Edit returns closest matches only above threshold with surrounding context
   );
 
   assert.equal(scopedCloseResult.ok, false);
-  const scopedClosestMatch = scopedCloseResult.metadata?.closest_match as
-    | { start_line?: number; end_line?: number; preview?: string }
-    | undefined;
-  assert.equal(scopedClosestMatch?.start_line, 2);
-  assert.equal(scopedClosestMatch?.end_line, 3);
-  assert.doesNotMatch(scopedClosestMatch?.preview ?? "", /const before = true/);
+  assert.equal(scopedCloseResult.error, "old_string not found in file.");
+  assert.equal(scopedCloseResult.metadata?.closest_match, undefined);
+});
+
+test("Edit appends an LLM diagnosis when old_string is not found", async () => {
+  const workspace = createTempWorkspace();
+  const filePath = path.join(workspace, "diagnose.ts");
+  fs.writeFileSync(
+    filePath,
+    [
+      "const beforeOne = true;",
+      "const beforeTwo = true;",
+      "function computeSubtotal(value: number) {",
+      "  return value;",
+      "}",
+      "const afterOne = true;",
+      "const afterTwo = true;",
+      "const afterThree = true;",
+    ].join("\n"),
+    "utf8"
+  );
+
+  const sessionId = "llm-not-found-diagnosis";
+  const readResult = await handleReadTool(
+    { file_path: filePath, offset: 3, limit: 2 },
+    createContext(sessionId, workspace)
+  );
+  const snippet = (readResult.metadata?.snippet ?? null) as { id: string } | null;
+  assert.ok(snippet);
+
+  let llmCalls = 0;
+  let prompt = "";
+  const editResult = await handleEditTool(
+    {
+      snippet_id: snippet.id,
+      old_string: "function computeTotal(value: number) {\n  return value;",
+      new_string: "function computeTotal(input: number) {\n  return input;",
+    },
+    createContext(sessionId, workspace, {
+      createOpenAIClient: () => ({
+        client: {
+          chat: {
+            completions: {
+              create: async (request: { messages?: Array<{ content?: string }> }) => {
+                llmCalls += 1;
+                prompt = String(request.messages?.[1]?.content ?? "");
+                return {
+                  choices: [
+                    {
+                      message: {
+                        content:
+                          "<response><reason><![CDATA[The requested function name is computeTotal, but the snippet contains computeSubtotal.]]></reason></response>",
+                      },
+                    },
+                  ],
+                };
+              },
+            },
+          },
+        } as any,
+        model: "test-model",
+        thinkingEnabled: false,
+      }),
+    })
+  );
+
+  assert.equal(editResult.ok, false);
+  assert.equal(llmCalls, 1);
+  assert.equal(
+    editResult.error,
+    "old_string not found in file. The requested function name is computeTotal, but the snippet contains computeSubtotal."
+  );
+  assert.equal(editResult.metadata?.closest_match, undefined);
+  assert.match(prompt, /<content_before_snippet><!\[CDATA\[const beforeOne = true;\nconst beforeTwo = true;\]\]>/);
+  assert.match(prompt, /<snippet_text><!\[CDATA\[function computeSubtotal\(value: number\) \{\n {2}return value;\n/);
+  assert.match(prompt, /<content_after_snippet><!\[CDATA\[\}\nconst afterOne = true;\]\]>/);
+  assert.doesNotMatch(prompt, /const afterTwo = true/);
+});
+
+test("Edit keeps the base not-found error when the LLM diagnosis is unavailable", async () => {
+  const workspace = createTempWorkspace();
+  const filePath = path.join(workspace, "invalid-diagnosis.ts");
+  fs.writeFileSync(filePath, "const existing = true;\n", "utf8");
+
+  const sessionId = "invalid-llm-not-found-diagnosis";
+  const snippet = await readSnippet(filePath, sessionId, workspace);
+
+  const editResult = await handleEditTool(
+    {
+      snippet_id: snippet.id,
+      old_string: "const missing = true;",
+      new_string: "const missing = false;",
+    },
+    createContext(sessionId, workspace, {
+      createOpenAIClient: () => ({
+        client: {
+          chat: {
+            completions: {
+              create: async () => ({
+                choices: [{ message: { content: "<response></response>" } }],
+              }),
+            },
+          },
+        } as any,
+        model: "test-model",
+        thinkingEnabled: false,
+      }),
+    })
+  );
+
+  assert.equal(editResult.ok, false);
+  assert.equal(editResult.error, "old_string not found in file.");
+  assert.equal(editResult.metadata?.closest_match, undefined);
 });
 
 test("Edit allows outdated snippet matches but reports outdated snippet when no match is found", async () => {
@@ -383,11 +605,11 @@ test("replace_all requires expected_occurrences for broad short-fragment replace
   fs.writeFileSync(filePath, [fragment, fragment, fragment].join("\n---\n"), "utf8");
 
   const sessionId = "replace-all-guard";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   const blockedResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: fragment,
       new_string: "        schema:\n          type: array",
       replace_all: true,
@@ -400,7 +622,7 @@ test("replace_all requires expected_occurrences for broad short-fragment replace
 
   const allowedResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: fragment,
       new_string: "        schema:\n          type: array",
       replace_all: true,
@@ -426,11 +648,11 @@ test("Edit accepts a unique loose-escape match when only escaping differs", asyn
   fs.writeFileSync(filePath, "params['city_json'] = f'\"{city}\"'\n", "utf8");
 
   const sessionId = "closest-match";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   const editResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: "params['city_json'] = f'\\\\\"{city}\\\\\"'",
       new_string: "params['city_json'] = city",
     },
@@ -472,12 +694,12 @@ test("Edit accepts a unique loose-escape match for over-escaped unicode sequence
   fs.writeFileSync(filePath, 'const sequence = "\\u001B[13;2~";\n', "utf8");
 
   const sessionId = "unicode-loose-escape";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   let llmCalls = 0;
   const editResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: 'const sequence = "\\\\u001B[13;2~";',
       new_string: 'const sequence = "\\\\u001B[13;130u";',
     },
@@ -524,11 +746,11 @@ test("Edit strips accidental read-result tabs after newlines when that creates a
   fs.writeFileSync(filePath, ["function demo() {", "  return 1;", "}"].join("\n") + "\n", "utf8");
 
   const sessionId = "line-leading-tab-correction";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   const editResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: "function demo() {\n\t  return 1;\n\t}",
       new_string: "function demo() {\n\t  return 2;\n\t}",
     },
@@ -565,7 +787,7 @@ test("Write repairs JSON object content for .json files", async () => {
   assert.equal(fs.readFileSync(filePath, "utf8"), '{\n  "name": "demo",\n  "private": true\n}');
 });
 
-test("Write updates file state so a follow-up Edit can succeed without another Read", async () => {
+test("Edit requires snippet_id even after Write refreshes file state", async () => {
   const workspace = createTempWorkspace();
   const filePath = path.join(workspace, "note.txt");
 
@@ -590,11 +812,55 @@ test("Write updates file state so a follow-up Edit can succeed without another R
     createContext("write-then-edit", workspace)
   );
 
+  assert.equal(editResult.ok, false);
+  assert.match(editResult.error ?? "", /snippet_id/);
+  assert.equal(fs.readFileSync(filePath, "utf8"), "alpha\nbeta\n");
+});
+
+test("Edit allows empty old_string when the file is empty", async () => {
+  const workspace = createTempWorkspace();
+  const filePath = path.join(workspace, "empty-edit.txt");
+  fs.writeFileSync(filePath, "", "utf8");
+
+  const sessionId = "edit-empty-existing";
+  const snippet = await readSnippet(filePath, sessionId, workspace);
+
+  const editResult = await handleEditTool(
+    {
+      snippet_id: snippet.id,
+      old_string: "",
+      new_string: "initialized\n",
+    },
+    createContext(sessionId, workspace)
+  );
+
   assert.equal(editResult.ok, true);
-  assert.equal(editResult.metadata?.read_scope_type, "full");
-  assert.match(String(editResult.metadata?.diff_preview ?? ""), /-beta/);
-  assert.match(String(editResult.metadata?.diff_preview ?? ""), /\+gamma/);
-  assert.equal(fs.readFileSync(filePath, "utf8"), "alpha\ngamma\n");
+  assert.equal(editResult.metadata?.matched_via, "empty_file");
+  assert.equal(editResult.metadata?.replaced_count, 1);
+  assert.match(String(editResult.metadata?.diff_preview ?? ""), /\+initialized/);
+  assert.equal(fs.readFileSync(filePath, "utf8"), "initialized\n");
+});
+
+test("Edit rejects empty old_string when the file is not empty", async () => {
+  const workspace = createTempWorkspace();
+  const filePath = path.join(workspace, "non-empty-edit.txt");
+  fs.writeFileSync(filePath, "alpha\n", "utf8");
+
+  const sessionId = "edit-empty-old-string-non-empty-file";
+  const snippet = await readSnippet(filePath, sessionId, workspace);
+
+  const editResult = await handleEditTool(
+    {
+      snippet_id: snippet.id,
+      old_string: "",
+      new_string: "initialized\n",
+    },
+    createContext(sessionId, workspace)
+  );
+
+  assert.equal(editResult.ok, false);
+  assert.equal(editResult.error, "old_string must not be empty unless the file is empty.");
+  assert.equal(fs.readFileSync(filePath, "utf8"), "alpha\n");
 });
 
 test("Write requires a full read before overwriting an existing file", async () => {
@@ -643,7 +909,7 @@ test("Edit rejects stale reads after the file changes on disk", async () => {
   fs.writeFileSync(filePath, "before\n", "utf8");
 
   const sessionId = "stale-edit";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   fs.writeFileSync(filePath, "after\n", "utf8");
   const futureTime = new Date(Date.now() + 2000);
@@ -651,7 +917,7 @@ test("Edit rejects stale reads after the file changes on disk", async () => {
 
   const editResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: "after",
       new_string: "final",
     },
@@ -685,11 +951,11 @@ test("Edit preserves CRLF line endings for existing files", async () => {
   fs.writeFileSync(filePath, "alpha\r\nbeta\r\n", "utf8");
 
   const sessionId = "crlf-edit";
-  await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  const snippet = await readSnippet(filePath, sessionId, workspace);
 
   const editResult = await handleEditTool(
     {
-      file_path: filePath,
+      snippet_id: snippet.id,
       old_string: "beta",
       new_string: "gamma",
     },
@@ -756,6 +1022,22 @@ function createTempWorkspace(): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "deepcode-tools-"));
   tempDirs.push(dir);
   return dir;
+}
+
+async function readSnippet(
+  filePath: string,
+  sessionId: string,
+  workspace: string
+): Promise<{ id: string; startLine: number; endLine: number }> {
+  const readResult = await handleReadTool({ file_path: filePath }, createContext(sessionId, workspace));
+  assert.equal(readResult.ok, true);
+  const snippet = (readResult.metadata?.snippet ?? null) as {
+    id: string;
+    startLine: number;
+    endLine: number;
+  } | null;
+  assert.ok(snippet);
+  return snippet;
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {

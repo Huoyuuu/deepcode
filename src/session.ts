@@ -2,16 +2,18 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import * as crypto from "crypto";
-import { fileURLToPath } from "url";
 import matter from "gray-matter";
 import ejs from "ejs";
-import type { ChatCompletionMessageParam, ChatCompletionContentPart } from "openai/resources/chat/completions";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { launchNotifyScript } from "./common/notify";
 import { buildThinkingRequestOptions } from "./common/openai-thinking";
-import { DEEPSEEK_V4_MODELS, supportsMultimodal } from "./common/model-capabilities";
+import { DEEPSEEK_V4_MODELS } from "./common/model-capabilities";
+import { readTextFileWithMetadata } from "./common/file-utils";
 import {
+  buildSkillDocumentsPrompt,
   getCompactPrompt,
   getDefaultSkillPrompt,
+  getExtensionRoot,
   getRuntimeContext,
   getSystemPrompt,
   getTools,
@@ -22,19 +24,49 @@ import {
   type CreateOpenAIClient,
   type ProcessTimeoutControl,
   type ProcessTimeoutInfo,
+  type ToolCallExecution,
+  type ToolExecutionHooks,
 } from "./tools/executor";
 import { McpManager } from "./mcp/mcp-manager";
-import type { McpServerConfig } from "./settings";
+import type { McpServerConfig, PermissionScope, PermissionSettings } from "./settings";
 import { logApiError } from "./common/error-logger";
 import { logOpenAIChatCompletionDebug, normalizeDebugError } from "./common/debug-logger";
 import { killProcessTree } from "./common/process-tree";
-import { GitFileHistory } from "./common/file-history";
+import { GitFileHistory, type FileHistoryCheckpointResult } from "./common/file-history";
+import { clearSessionState, getSnippet, rebuildSessionStateFromHistory } from "./common/state";
+import {
+  appendProjectPermissionAllows,
+  buildPermissionToolExecution,
+  computeToolCallPermissions,
+  hasUserPermissionReplies,
+  normalizeAskPermissions,
+  parseToolCallForPermissions,
+  type AskPermissionRequest,
+  type MessageToolPermission,
+  type PermissionToolCall,
+  type UserToolPermission,
+} from "./common/permissions";
+import { clearSessionWorkingDir } from "./tools/bash-handler";
+import { reportNewPrompt } from "./common/telemetry";
+import { OpenAIMessageConverter } from "./common/openai-message-converter";
+
+export type { PermissionScope } from "./settings";
+export type {
+  AskPermissionRequest,
+  AskPermissionScope,
+  BashPermissionScope,
+  MessageToolPermission,
+  PermissionDecision,
+  UserToolPermission,
+} from "./common/permissions";
 
 const MAX_SESSION_ENTRIES = 50;
-const DEFAULT_NEW_PROMPT_API_URL = "https://deepcode.vegamo.cn/api/plugin/new";
-const NEW_PROMPT_REPORT_TIMEOUT_MS = 3000;
+const MAX_PROJECT_CODE_LENGTH = 64;
+const PROJECT_CODE_HASH_LENGTH = 16;
+const BACKGROUND_FAILURE_LOG_TAIL_CHARS = 4000;
 const DEFAULT_COMPACT_PROMPT_TOKEN_THRESHOLD = 128 * 1024;
 const DEEPSEEK_V4_COMPACT_PROMPT_TOKEN_THRESHOLD = 512 * 1024;
+const PLAN_MODE_STATUS_MESSAGE = "/plan\n  └ Set Plan Mode on. Awaiting <proposed_plan>.";
 
 type ChatCompletionDebugOptions = {
   enabled?: boolean;
@@ -47,6 +79,36 @@ export function getCompactPromptTokenThreshold(model: string): number {
   return DEEPSEEK_V4_MODELS.has(model)
     ? DEEPSEEK_V4_COMPACT_PROMPT_TOKEN_THRESHOLD
     : DEFAULT_COMPACT_PROMPT_TOKEN_THRESHOLD;
+}
+
+// Keep project storage paths short enough for Git's internal files on Windows.
+export function getProjectCode(projectRoot: string): string {
+  const legacyCode = getLegacyProjectCode(projectRoot);
+  if (legacyCode.length <= MAX_PROJECT_CODE_LENGTH) {
+    return legacyCode;
+  }
+
+  const normalizedRoot = path.resolve(projectRoot);
+  const hashInput = process.platform === "win32" ? normalizedRoot.toLowerCase() : normalizedRoot;
+  const hash = crypto.createHash("sha256").update(hashInput).digest("hex").slice(0, PROJECT_CODE_HASH_LENGTH);
+  const prefixLimit = MAX_PROJECT_CODE_LENGTH - PROJECT_CODE_HASH_LENGTH - 1;
+  const basename = path.basename(normalizedRoot);
+  const prefix =
+    sanitizeProjectCodePart(basename)
+      .slice(0, prefixLimit)
+      .replace(/[-.]+$/g, "") || "project";
+  return `${prefix}-${hash}`;
+}
+
+function getLegacyProjectCode(projectRoot: string): string {
+  return projectRoot.replace(/[\\/]/g, "-").replace(/:/g, "");
+}
+
+function sanitizeProjectCodePart(value: string): string {
+  return value
+    .replace(/[^A-Za-z0-9._-]/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[-.]+|[-.]+$/g, "");
 }
 
 function isUsageRecord(value: unknown): value is Record<string, unknown> {
@@ -110,15 +172,6 @@ function accumulateUsagePerModel(
   return usagePerModel;
 }
 
-function getExtensionRoot(): string {
-  if (typeof __dirname !== "undefined") {
-    return path.resolve(__dirname, "..");
-  }
-
-  const currentFilePath = fileURLToPath(import.meta.url);
-  return path.resolve(path.dirname(currentFilePath), "..");
-}
-
 function getTotalTokens(usage: ModelUsage | null | undefined): number {
   if (!isUsageRecord(usage)) {
     return 0;
@@ -127,7 +180,15 @@ function getTotalTokens(usage: ModelUsage | null | undefined): number {
   return typeof totalTokens === "number" ? totalTokens : 0;
 }
 
-export type SessionStatus = "failed" | "pending" | "processing" | "waiting_for_user" | "completed" | "interrupted";
+export type SessionStatus =
+  | "failed"
+  | "pending"
+  | "processing"
+  | "waiting_for_user"
+  | "completed"
+  | "interrupted"
+  | "ask_permission"
+  | "permission_denied";
 
 export type ModelUsage = {
   prompt_tokens: number;
@@ -170,6 +231,7 @@ export type SessionEntry = {
   createTime: string;
   updateTime: string;
   processes: Map<string, SessionProcessEntry> | null; // {pid: process info}
+  askPermissions?: AskPermissionRequest[];
 };
 
 export type SessionsIndex = {
@@ -188,6 +250,8 @@ export type MessageMeta = {
   isSummary?: boolean;
   isModelChange?: boolean;
   skill?: SkillInfo;
+  permissions?: MessageToolPermission[];
+  userPrompt?: UserPromptContent;
 };
 
 export type SessionMessage = {
@@ -216,6 +280,8 @@ export type UserPromptContent = {
   text?: string;
   imageUrls?: string[];
   skills?: SkillInfo[];
+  permissions?: UserToolPermission[];
+  alwaysAllows?: PermissionScope[];
 };
 
 export type SkillInfo = {
@@ -223,12 +289,19 @@ export type SkillInfo = {
   path: string;
   description: string;
   isLoaded?: boolean;
+  allowImplicitInvocation?: boolean;
 };
 
 type SessionManagerOptions = {
   projectRoot: string;
   createOpenAIClient: CreateOpenAIClient;
-  getResolvedSettings: () => { model: string; webSearchTool?: string; mcpServers?: Record<string, McpServerConfig> };
+  getResolvedSettings: () => {
+    model: string;
+    webSearchTool?: string;
+    mcpServers?: Record<string, McpServerConfig>;
+    permissions?: Required<PermissionSettings>;
+    enabledSkills?: Record<string, boolean>;
+  };
   renderMarkdown: (text: string) => string;
   onAssistantMessage: (message: SessionMessage, shouldConnect: boolean) => void;
   onSessionEntryUpdated?: (entry: SessionEntry) => void;
@@ -253,6 +326,8 @@ export class SessionManager {
     model: string;
     webSearchTool?: string;
     mcpServers?: Record<string, McpServerConfig>;
+    permissions?: Required<PermissionSettings>;
+    enabledSkills?: Record<string, boolean>;
   };
   private readonly onAssistantMessage: (message: SessionMessage, shouldConnect: boolean) => void;
   private readonly onSessionEntryUpdated?: (entry: SessionEntry) => void;
@@ -263,9 +338,11 @@ export class SessionManager {
   private activePromptController: AbortController | null = null;
   private readonly sessionControllers = new Map<string, AbortController>();
   private readonly processTimeoutControls = new Map<string, ProcessTimeoutControl>();
+  private readonly liveProcessKeys = new Set<string>();
   private readonly toolExecutor: ToolExecutor;
   private readonly mcpManager = new McpManager();
   private mcpToolDefinitions: ToolDefinition[] = [];
+  private readonly messageConverter: OpenAIMessageConverter;
 
   constructor(options: SessionManagerOptions) {
     this.projectRoot = options.projectRoot;
@@ -278,6 +355,21 @@ export class SessionManager {
     this.onProcessStdout = options.onProcessStdout;
     this.toolExecutor = new ToolExecutor(this.projectRoot, this.createOpenAIClient, this.mcpManager);
     this.mcpManager.prepare(this.getResolvedSettings().mcpServers);
+    this.messageConverter = new OpenAIMessageConverter({
+      renderInitPrompt: () => this.renderInitCommandPrompt(),
+    });
+  }
+
+  /**
+   * @deprecated Use messageConverter.buildMessages directly.
+   * Kept for test compatibility.
+   */
+  buildOpenAIMessages(
+    messages: SessionMessage[],
+    thinkingEnabled: boolean,
+    model: string
+  ): ChatCompletionMessageParam[] {
+    return this.messageConverter.buildMessages(messages, thinkingEnabled, model);
   }
 
   async initMcpServers(servers?: Record<string, McpServerConfig>): Promise<void> {
@@ -302,6 +394,19 @@ export class SessionManager {
   }
 
   dispose(): void {
+    const controller = this.activePromptController;
+    if (controller && !controller.signal.aborted) {
+      controller.abort();
+    }
+    this.activePromptController = null;
+    for (const sessionController of this.sessionControllers.values()) {
+      if (!sessionController.signal.aborted) {
+        sessionController.abort();
+      }
+    }
+    this.killLiveProcesses();
+    this.sessionControllers.clear();
+    this.processTimeoutControls.clear();
     this.mcpManager.disconnect();
   }
 
@@ -618,7 +723,7 @@ export class SessionManager {
     options?: { signal?: AbortSignal; sessionId?: string }
   ): Promise<string[]> {
     this.throwIfAborted(options?.signal);
-    let systemPrompt = `When users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.\n
+    let systemPrompt = `When users ask you to perform tasks, check if any of the available skills match the goal and situation. Skills provide specialized capabilities and domain knowledge.\n
 Response in JSON format:
 \`\`\`
 {
@@ -626,27 +731,39 @@ Response in JSON format:
 }
 \`\`\`\n
 If none of the available skills match, respond with an empty array, i.e. \`{"skillNames": []}\`.\n
-The candidate skills are as follows:\n\n`;
+`;
     const simpleSkills = skills
-      .filter((x) => !x.isLoaded)
+      .filter((x) => !x.isLoaded && x.allowImplicitInvocation !== false)
       .map((x) => {
         return { name: x.name, description: x.description };
       });
     if (simpleSkills.length === 0) {
       return [];
     }
-    systemPrompt += "```\n" + JSON.stringify(simpleSkills, null, 2) + "\n```";
+    const candidateSkillNames = new Set(simpleSkills.map((skill) => skill.name));
 
     const { client, model, baseURL, debugLogEnabled } = this.createOpenAIClient();
     if (!client) {
       return [];
     }
 
+    const agentInstructions = this.loadAgentInstructions();
+    if (agentInstructions) {
+      systemPrompt += `Use the current agent instructions as additional context when deciding which skills match:\n
+<agent-instructions>
+${agentInstructions}
+</agent-instructions>\n
+`;
+    }
+    systemPrompt += "The candidate skills are as follows:\n\n";
+    systemPrompt += "```\n" + JSON.stringify(simpleSkills, null, 2) + "\n```";
+
     try {
       const response = await this.createChatCompletionStream(
         client,
         {
           model,
+          temperature: 0.1,
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: userPrompt },
@@ -659,7 +776,7 @@ The candidate skills are as follows:\n\n`;
           enabled: debugLogEnabled,
           location: "SessionManager.identifyMatchingSkillNames",
           baseURL,
-          params: { purpose: "skill-matching" },
+          params: { purpose: "skill-matching", temperature: 0.1 },
         }
       );
       this.throwIfAborted(options?.signal);
@@ -672,7 +789,10 @@ The candidate skills are as follows:\n\n`;
 
       const parsed = JSON.parse(content);
       if (parsed && Array.isArray(parsed.skillNames)) {
-        return parsed.skillNames;
+        return parsed.skillNames.filter(
+          (skillName: unknown): skillName is string =>
+            typeof skillName === "string" && candidateSkillNames.has(skillName)
+        );
       }
 
       return [];
@@ -684,11 +804,32 @@ The candidate skills are as follows:\n\n`;
     }
   }
 
-  async listSkills(sessionId?: string): Promise<SkillInfo[]> {
+  private getSkillScanRoots(): Array<{ root: string; displayRoot: string }> {
     const homeDir = os.homedir();
-    const agentsRoot = path.join(homeDir, ".agents", "skills");
-    const legacyProjectSkillsRoot = path.join(this.projectRoot, ".deepcode", "skills");
-    const projectAgentsSkillsRoot = path.join(this.projectRoot, ".agents", "skills");
+    return [
+      { root: path.join(this.projectRoot, ".deepcode", "skills"), displayRoot: "./.deepcode/skills" },
+      { root: path.join(this.projectRoot, ".agents", "skills"), displayRoot: "./.agents/skills" },
+      { root: path.join(homeDir, ".deepcode", "skills"), displayRoot: "~/.deepcode/skills" },
+      { root: path.join(homeDir, ".agents", "skills"), displayRoot: "~/.agents/skills" },
+      { root: this.getBundledSkillsRoot(), displayRoot: "bundled:" },
+    ];
+  }
+
+  private getBundledSkillsRoot(): string {
+    const extensionRoot = getExtensionRoot();
+    const sourceRoot = path.join(extensionRoot, "templates", "skills", "bundled");
+    const distRoot = path.join(extensionRoot, "dist", "bundled");
+
+    // Source check keeps local development/tests on the checked-in templates.
+    if (fs.existsSync(path.join(extensionRoot, "src", "session.ts")) && fs.existsSync(sourceRoot)) {
+      return sourceRoot;
+    }
+    return fs.existsSync(distRoot) ? distRoot : sourceRoot;
+  }
+
+  async listSkills(sessionId?: string): Promise<SkillInfo[]> {
+    const skillRoots = this.getSkillScanRoots();
+    const enabledSkills = this.getResolvedSettings().enabledSkills ?? {};
     const skillsByName = new Map<string, SkillInfo>();
 
     const collectSkills = (root: string, displayRoot: string): SkillInfo[] => {
@@ -720,19 +861,23 @@ The candidate skills are as follows:\n\n`;
         } catch {
           continue;
         }
-        results.push(this.readSkillInfo(skillPath, `${displayRoot}/${skillName}/SKILL.md`, skillName));
+        const displayPath =
+          displayRoot === "bundled:" ? `bundled:${skillName}/SKILL.md` : `${displayRoot}/${skillName}/SKILL.md`;
+        const skill = this.readSkillInfo(skillPath, displayPath, skillName);
+        if (enabledSkills[skill.name] === false) {
+          continue;
+        }
+        results.push(skill);
       }
       return results;
     };
 
-    for (const skill of collectSkills(agentsRoot, "~/.agents/skills")) {
-      skillsByName.set(skill.name, skill);
-    }
-    for (const skill of collectSkills(legacyProjectSkillsRoot, "./.deepcode/skills")) {
-      skillsByName.set(skill.name, skill);
-    }
-    for (const skill of collectSkills(projectAgentsSkillsRoot, "./.agents/skills")) {
-      skillsByName.set(skill.name, skill);
+    for (const { root, displayRoot } of skillRoots) {
+      for (const skill of collectSkills(root, displayRoot)) {
+        if (!skillsByName.has(skill.name)) {
+          skillsByName.set(skill.name, skill);
+        }
+      }
     }
 
     if (sessionId) {
@@ -748,6 +893,16 @@ The candidate skills are as follows:\n\n`;
   }
 
   private resolveSkillPath(skillPath: string): string {
+    if (skillPath.startsWith("bundled:")) {
+      const relativePath = skillPath.slice("bundled:".length);
+      const root = this.getBundledSkillsRoot();
+      const resolvedPath = path.resolve(root, relativePath);
+      const resolvedRoot = path.resolve(root);
+      if (resolvedPath === resolvedRoot || !resolvedPath.startsWith(`${resolvedRoot}${path.sep}`)) {
+        return path.join(root, "__invalid_bundled_skill__");
+      }
+      return resolvedPath;
+    }
     if (skillPath.startsWith("~/")) {
       return path.join(os.homedir(), skillPath.slice(2));
     }
@@ -766,6 +921,18 @@ The candidate skills are as follows:\n\n`;
     return path.join(os.homedir(), skillPath);
   }
 
+  private buildSkillPrompt(skill: SkillInfo): string {
+    const skillPath = this.resolveSkillPath(skill.path);
+    return buildSkillDocumentsPrompt([
+      {
+        name: skill.name,
+        content: fs.readFileSync(skillPath, "utf8"),
+        path: skillPath,
+        skillFilePath: skillPath,
+      },
+    ]);
+  }
+
   private readSkillInfo(skillPath: string, displayPath: string, fallbackName: string): SkillInfo {
     const fallbackSkill: SkillInfo = {
       name: fallbackName.replace(/_/g, "-"),
@@ -776,6 +943,14 @@ The candidate skills are as follows:\n\n`;
     try {
       const skillMd = fs.readFileSync(skillPath, "utf8");
       const parsed = matter(skillMd);
+      const metadata = parsed.data.metadata;
+      const allowImplicitInvocation =
+        metadata &&
+        typeof metadata === "object" &&
+        !Array.isArray(metadata) &&
+        (metadata as Record<string, unknown>)["allow-implicit-invocation"] === false
+          ? false
+          : undefined;
       return {
         name:
           typeof parsed.data.name === "string" && parsed.data.name.trim()
@@ -783,6 +958,7 @@ The candidate skills are as follows:\n\n`;
             : fallbackSkill.name,
         path: displayPath,
         description: typeof parsed.data.description === "string" ? parsed.data.description.trim() : "",
+        allowImplicitInvocation,
       };
     } catch {
       return fallbackSkill;
@@ -861,6 +1037,25 @@ The candidate skills are as follows:\n\n`;
     });
   }
 
+  private appendSkillMessages(sessionId: string, skills?: SkillInfo[]): void {
+    if (!skills || skills.length === 0) {
+      return;
+    }
+
+    for (const skill of skills) {
+      if (skill.name === "plan") {
+        this.appendSessionMessage(sessionId, this.buildSystemMessage(sessionId, PLAN_MODE_STATUS_MESSAGE));
+      }
+      if (skill.isLoaded) {
+        continue;
+      }
+      const skillPrompt = this.buildSkillPrompt(skill);
+      const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
+      this.appendSessionMessage(sessionId, skillMessage);
+      this.onAssistantMessage(skillMessage, true);
+    }
+  }
+
   getActiveSessionId(): string | null {
     return this.activeSessionId;
   }
@@ -901,20 +1096,6 @@ The candidate skills are as follows:\n\n`;
     const signal = controller?.signal;
     this.throwIfAborted(signal);
 
-    if (userPrompt.text) {
-      const skills = await this.listSkills();
-      const skillNames = await this.identifyMatchingSkillNames(skills, userPrompt.text, { signal });
-      this.throwIfAborted(signal);
-      const skillSet = new Set(skillNames);
-      const matchedSkill = skills.filter((skill) => skillSet.has(skill.name));
-      if (Array.isArray(userPrompt.skills)) {
-        userPrompt.skills.push(...matchedSkill);
-      } else if (matchedSkill.length > 0) {
-        userPrompt.skills = matchedSkill;
-      }
-    }
-    userPrompt.skills = await this.normalizeSkills(userPrompt.skills);
-    this.throwIfAborted(signal);
     const sessionId = crypto.randomUUID();
     this.ensureFileHistorySession(sessionId);
     const now = new Date().toISOString();
@@ -949,14 +1130,19 @@ The candidate skills are as follows:\n\n`;
     const droppedEntries = sortedEntries.filter((item) => !keptIds.has(item.id));
     index.entries = keptEntries;
     this.saveSessionsIndex(index);
-    this.removeSessionMessages(droppedEntries.map((item) => item.id));
+    for (const dropped of droppedEntries) {
+      this.cleanupSessionResources(dropped.id, {
+        removeMessages: true,
+        processIds: this.getProcessIds(dropped.processes ?? null),
+      });
+    }
 
     const promptToolOptions = this.getPromptToolOptions();
     const systemPrompt = getSystemPrompt(this.projectRoot, promptToolOptions);
     const systemMessage = this.buildSystemMessage(sessionId, systemPrompt);
     this.appendSessionMessage(sessionId, systemMessage);
 
-    const defaultSkillPrompt = getDefaultSkillPrompt();
+    const defaultSkillPrompt = getDefaultSkillPrompt({ enabledSkills: this.getResolvedSettings().enabledSkills });
     if (defaultSkillPrompt) {
       const defaultSkillMessage = this.buildSystemMessage(sessionId, defaultSkillPrompt);
       this.appendSessionMessage(sessionId, defaultSkillMessage);
@@ -974,24 +1160,26 @@ The candidate skills are as follows:\n\n`;
       this.appendSessionMessage(sessionId, instructionsMessage);
     }
 
+    this.recordUserPromptCheckpoint(sessionId);
     const userMessage = this.buildUserMessage(sessionId, userPrompt);
     this.appendSessionMessage(sessionId, userMessage);
 
-    if (userPrompt.skills && userPrompt.skills.length > 0) {
-      for (const skill of userPrompt.skills) {
-        if (skill.isLoaded) {
-          continue;
-        }
-        const skillMd = fs.readFileSync(this.resolveSkillPath(skill.path), "utf8");
-        const skillPrompt = `Use the skill document below to assist the user:\n
-<${skill.name}-skill path="${this.resolveSkillPath(skill.path)}">
-${skillMd}
-</${skill.name}-skill>`;
-        const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
-        this.appendSessionMessage(sessionId, skillMessage);
-        this.onAssistantMessage(skillMessage, true);
+    if (userPrompt.text) {
+      const skills = await this.listSkills();
+      const skillNames = await this.identifyMatchingSkillNames(skills, userPrompt.text, { signal });
+      this.throwIfAborted(signal);
+      const skillSet = new Set(skillNames);
+      const matchedSkill = skills.filter((skill) => skillSet.has(skill.name));
+      if (Array.isArray(userPrompt.skills)) {
+        userPrompt.skills.push(...matchedSkill);
+      } else if (matchedSkill.length > 0) {
+        userPrompt.skills = matchedSkill;
       }
     }
+    userPrompt.skills = await this.normalizeSkills(userPrompt.skills);
+    this.throwIfAborted(signal);
+
+    this.appendSkillMessages(sessionId, userPrompt.skills);
 
     this.activeSessionId = sessionId;
     await this.activateSession(sessionId, controller);
@@ -1001,11 +1189,15 @@ ${skillMd}
   async replySession(sessionId: string, userPrompt: UserPromptContent, controller?: AbortController): Promise<void> {
     const signal = controller?.signal;
     this.throwIfAborted(signal);
+    appendProjectPermissionAllows(this.projectRoot, userPrompt.alwaysAllows, {
+      inheritedPermissions: this.getResolvedSettings().permissions,
+    });
     const now = new Date().toISOString();
     const updated = this.updateSessionEntry(sessionId, (entry) => ({
       ...entry,
       status: "pending",
       failReason: null,
+      askPermissions: undefined,
       updateTime: now,
     }));
 
@@ -1014,13 +1206,28 @@ ${skillMd}
       return;
     }
 
+    if (hasUserPermissionReplies(userPrompt) && this.hasTrailingPendingToolCalls(sessionId)) {
+      this.activeSessionId = sessionId;
+      await this.activateSession(sessionId, controller, userPrompt);
+      return;
+    }
+
     if (this.isContinuePrompt(userPrompt)) {
       this.activeSessionId = sessionId;
-      await this.activateSession(sessionId, controller);
+      await this.activateSession(sessionId, controller, userPrompt);
       return;
     }
 
     this.reportNewPrompt();
+
+    this.ensureFileHistorySession(sessionId);
+    const checkpoint = this.recordUserPromptCheckpoint(sessionId);
+    if (checkpoint.changedFilePaths.length) {
+      const content = `Note that the user manually modified these files:\n${checkpoint.changedFilePaths.join("\n")}`;
+      this.appendSessionMessage(sessionId, this.buildSystemMessage(sessionId, content));
+    }
+    const userMessage = this.buildUserMessage(sessionId, userPrompt);
+    this.appendSessionMessage(sessionId, userMessage);
 
     if (userPrompt.text) {
       const skills = await this.listSkills(sessionId);
@@ -1037,25 +1244,7 @@ ${skillMd}
     userPrompt.skills = await this.normalizeSkills(userPrompt.skills, sessionId);
     this.throwIfAborted(signal);
 
-    this.ensureFileHistorySession(sessionId);
-    const userMessage = this.buildUserMessage(sessionId, userPrompt);
-    this.appendSessionMessage(sessionId, userMessage);
-
-    if (userPrompt.skills && userPrompt.skills.length > 0) {
-      for (const skill of userPrompt.skills) {
-        if (skill.isLoaded) {
-          continue;
-        }
-        const skillMd = fs.readFileSync(this.resolveSkillPath(skill.path), "utf8");
-        const skillPrompt = `Use the skill document below to assist the user:\n
-<${skill.name}-skill path="${this.resolveSkillPath(skill.path)}">
-${skillMd}
-</${skill.name}-skill>`;
-        const skillMessage = this.buildSkillMessage(sessionId, skillPrompt, skill);
-        this.appendSessionMessage(sessionId, skillMessage);
-        this.onAssistantMessage(skillMessage, true);
-      }
-    }
+    this.appendSkillMessages(sessionId, userPrompt.skills);
     this.activeSessionId = sessionId;
     await this.activateSession(sessionId, controller);
   }
@@ -1069,23 +1258,28 @@ ${skillMd}
     );
   }
 
-  async activateSession(sessionId: string, controller?: AbortController): Promise<void> {
+  async activateSession(
+    sessionId: string,
+    controller?: AbortController,
+    permissionPrompt?: UserPromptContent
+  ): Promise<void> {
     const startedAt = Date.now();
-    const { client, model, baseURL, thinkingEnabled, reasoningEffort, debugLogEnabled, notify, env } =
+    const { client, model, baseURL, temperature, thinkingEnabled, reasoningEffort, debugLogEnabled, notify, env } =
       this.createOpenAIClient();
     const now = new Date().toISOString();
+    rebuildSessionStateFromHistory(sessionId, this.listSessionMessages(sessionId));
 
     if (!client) {
       this.updateSessionEntry(sessionId, (entry) => ({
         ...entry,
         status: "failed",
-        failReason: "OpenAI API key not found",
+        failReason: "API key not found",
         updateTime: now,
       }));
       this.onAssistantMessage(
         this.buildAssistantMessage(
           sessionId,
-          "OpenAI API key not found. Please configure ~/.deepcode/settings.json or ./.deepcode/settings.json.",
+          "API key not found. Please configure ~/.deepcode/settings.json or ./.deepcode/settings.json.",
           null
         ),
         false
@@ -1128,16 +1322,24 @@ ${skillMd}
           return;
         }
 
-        const pendingToolCalls = this.getTrailingPendingToolCalls(this.listSessionMessages(sessionId));
-        if (pendingToolCalls.length > 0) {
-          const toolAppendResult = await this.appendToolMessages(sessionId, pendingToolCalls);
+        const pendingToolCallMessage = this.messageConverter.getTrailingPendingToolCallMessage(
+          this.listSessionMessages(sessionId)
+        );
+        if (pendingToolCallMessage.toolCalls.length > 0) {
+          const toolAppendResult = await this.appendToolMessages(sessionId, pendingToolCallMessage.toolCalls, {
+            permissionOverrides: permissionPrompt?.permissions,
+            messagePermissions: pendingToolCallMessage.message?.meta?.permissions,
+          });
+          await this.appendDeferredPermissionPrompt(sessionId, permissionPrompt, sessionController);
+          // Permission replies are one-shot: do not reuse decisions or append the deferred user prompt again on later tool-call batches.
+          permissionPrompt = undefined;
           if (this.isInterrupted(sessionId)) {
             return;
           }
           if (toolAppendResult.waitingForUser) {
             this.updateSessionEntry(sessionId, (entry) => ({
               ...entry,
-              toolCalls: pendingToolCalls,
+              toolCalls: pendingToolCallMessage.toolCalls,
               status: "waiting_for_user",
               updateTime: new Date().toISOString(),
             }));
@@ -1157,12 +1359,17 @@ ${skillMd}
           await this.compactSession(sessionId, sessionController.signal);
         }
 
-        const messages = this.buildOpenAIMessages(this.listSessionMessages(sessionId), thinkingEnabled, model);
+        const messages = this.messageConverter.buildMessages(
+          this.listSessionMessages(sessionId),
+          thinkingEnabled,
+          model
+        );
         const thinkingOptions = buildThinkingRequestOptions(thinkingEnabled, baseURL, reasoningEffort);
         const response = await this.createChatCompletionStream(
           client,
           {
             model,
+            ...(temperature !== undefined ? { temperature } : {}),
             messages,
             tools: getTools(this.getPromptToolOptions(), this.mcpToolDefinitions),
             ...thinkingOptions,
@@ -1173,7 +1380,7 @@ ${skillMd}
             enabled: debugLogEnabled,
             location: "SessionManager.activateSession",
             baseURL,
-            params: { iteration, thinkingEnabled, reasoningEffort },
+            params: { iteration, temperature, thinkingEnabled, reasoningEffort },
           }
         );
 
@@ -1191,12 +1398,48 @@ ${skillMd}
           return;
         }
         const assistantMessage = this.buildAssistantMessage(sessionId, content, toolCalls, thinking);
+        const permissionPlan = toolCalls
+          ? computeToolCallPermissions({
+              sessionId,
+              projectRoot: this.projectRoot,
+              toolCalls,
+              settings: this.getResolvedSettings().permissions,
+              readPermissionExemptPaths: this.getSkillScanRoots().map((entry) => entry.root),
+              resolveSnippetPath: (id, snippetId) => getSnippet(id, snippetId)?.filePath,
+            })
+          : null;
+        if (permissionPlan) {
+          assistantMessage.meta = {
+            ...(assistantMessage.meta ?? {}),
+            permissions: permissionPlan.permissions,
+          };
+        }
         this.appendSessionMessage(sessionId, assistantMessage);
         this.onAssistantMessage(assistantMessage, true);
 
         let waitingForUser = false;
+        const responseUsage = response.usage ?? null;
         if (toolCalls) {
-          const toolAppendResult = await this.appendToolMessages(sessionId, toolCalls);
+          if (permissionPlan?.askPermissions.length) {
+            this.updateSessionEntry(sessionId, (entry) => ({
+              ...entry,
+              assistantReply: content,
+              assistantThinking: thinking,
+              assistantRefusal: refusal,
+              toolCalls,
+              usage: accumulateUsage(entry.usage, responseUsage),
+              usagePerModel: accumulateUsagePerModel(entry.usagePerModel, model, responseUsage),
+              activeTokens: getTotalTokens(responseUsage),
+              status: "ask_permission",
+              failReason: null,
+              askPermissions: permissionPlan.askPermissions,
+              updateTime: new Date().toISOString(),
+            }));
+            return;
+          }
+          const toolAppendResult = await this.appendToolMessages(sessionId, toolCalls, {
+            messagePermissions: permissionPlan?.permissions,
+          });
           waitingForUser = toolAppendResult.waitingForUser;
         }
 
@@ -1204,7 +1447,6 @@ ${skillMd}
           return;
         }
 
-        const responseUsage = response.usage ?? null;
         this.updateSessionEntry(sessionId, (entry) => ({
           ...entry,
           assistantReply: content,
@@ -1216,6 +1458,7 @@ ${skillMd}
           activeTokens: getTotalTokens(responseUsage),
           status: refusal ? "failed" : waitingForUser ? "waiting_for_user" : toolCalls ? "processing" : "completed",
           failReason: refusal ? refusal : entry.failReason,
+          askPermissions: undefined,
           updateTime: new Date().toISOString(),
         }));
 
@@ -1268,7 +1511,8 @@ ${skillMd}
 
   async compactSession(sessionId: string, signal?: AbortSignal): Promise<void> {
     this.throwIfAborted(signal);
-    const { client, model, baseURL, thinkingEnabled, reasoningEffort, debugLogEnabled } = this.createOpenAIClient();
+    const { client, model, baseURL, temperature, thinkingEnabled, reasoningEffort, debugLogEnabled } =
+      this.createOpenAIClient();
     if (!client) {
       return;
     }
@@ -1300,6 +1544,7 @@ ${skillMd}
       client,
       {
         model,
+        ...(temperature !== undefined ? { temperature } : {}),
         messages: [{ role: "user", content: compactPrompt }],
         ...thinkingOptions,
       },
@@ -1309,7 +1554,7 @@ ${skillMd}
         enabled: debugLogEnabled,
         location: "SessionManager.compactSession",
         baseURL,
-        params: { thinkingEnabled, reasoningEffort },
+        params: { temperature, thinkingEnabled, reasoningEffort },
       }
     );
     this.throwIfAborted(signal);
@@ -1358,25 +1603,8 @@ ${skillMd}
   }
 
   private reportNewPrompt(): void {
-    const { machineId } = this.createOpenAIClient();
-    if (!machineId) {
-      return;
-    }
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), NEW_PROMPT_REPORT_TIMEOUT_MS);
-
-    void fetch(DEFAULT_NEW_PROMPT_API_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Token: machineId,
-      },
-      body: JSON.stringify({}),
-      signal: controller.signal,
-    })
-      .catch(() => {})
-      .finally(() => clearTimeout(timeout));
+    const { machineId, telemetryEnabled } = this.createOpenAIClient();
+    reportNewPrompt({ enabled: telemetryEnabled ?? true, machineId });
   }
 
   interruptActiveSession(): void {
@@ -1397,7 +1625,9 @@ ${skillMd}
     const killedPids: number[] = [];
     const failedPids: number[] = [];
     for (const pid of processIds) {
-      this.processTimeoutControls.delete(this.getProcessControlKey(sessionId, pid));
+      const processControlKey = this.getProcessControlKey(sessionId, pid);
+      this.processTimeoutControls.delete(processControlKey);
+      this.liveProcessKeys.delete(processControlKey);
       if (killProcessTree(pid, "SIGKILL")) {
         killedPids.push(pid);
         continue;
@@ -1433,6 +1663,20 @@ ${skillMd}
 
   private isInterrupted(sessionId: string): boolean {
     return !this.sessionControllers.has(sessionId);
+  }
+
+  /**
+   * Mark a session's permission as denied by the user.
+   * Updates the session entry status and failReason so the denial is visible in the session list.
+   */
+  denySessionPermission(sessionId: string, reason?: string): void {
+    const now = new Date().toISOString();
+    this.updateSessionEntry(sessionId, (entry) => ({
+      ...entry,
+      status: "permission_denied",
+      failReason: reason ?? "Permission denied by user",
+      updateTime: now,
+    }));
   }
 
   adjustActiveBashTimeout(deltaMs: number): BashTimeoutAdjustment | null {
@@ -1474,6 +1718,51 @@ ${skillMd}
   getSession(sessionId: string): SessionEntry | null {
     const index = this.loadSessionsIndex();
     return index.entries.find((entry) => entry.id === sessionId) ?? null;
+  }
+
+  /**
+   * Delete a session by its ID.
+   * Removes the session entry from the index and cleans up associated resources
+   * such as message files, in-memory state caches, working directory state,
+   * session controllers, and tracked process timeout controls.
+   * Returns true if the session was found and deleted, false otherwise.
+   */
+  deleteSession(sessionId: string): boolean {
+    const index = this.loadSessionsIndex();
+    const targetEntry = index.entries.find((entry) => entry.id === sessionId) ?? null;
+    const nextEntries = index.entries.filter((entry) => entry.id !== sessionId);
+    if (nextEntries.length === index.entries.length) {
+      return false;
+    }
+
+    index.entries = nextEntries;
+    this.saveSessionsIndex(index);
+    this.cleanupSessionResources(sessionId, {
+      removeMessages: true,
+      processIds: this.getProcessIds(targetEntry?.processes ?? null),
+    });
+    return true;
+  }
+
+  /**
+   * Rename a session by updating its summary (display title).
+   * Returns true if the session was found and renamed, false otherwise.
+   */
+  renameSession(sessionId: string, summary: string): boolean {
+    const trimmed = summary.trim();
+    if (!trimmed) {
+      return false;
+    }
+    const entry = this.getSession(sessionId);
+    if (!entry) {
+      return false;
+    }
+    this.updateSessionEntry(sessionId, (existing) => ({
+      ...existing,
+      summary: trimmed,
+      updateTime: new Date().toISOString(),
+    }));
+    return true;
   }
 
   listSessionMessages(sessionId: string): SessionMessage[] {
@@ -1574,16 +1863,12 @@ ${skillMd}
     };
   }
 
-  private getProjectCode(projectRoot: string): string {
-    return projectRoot.replace(/[\\/]/g, "-").replace(/:/g, "");
-  }
-
   private getProjectStorage(): {
     projectCode: string;
     projectDir: string;
     sessionsIndexPath: string;
   } {
-    const projectCode = this.getProjectCode(this.projectRoot);
+    const projectCode = getProjectCode(this.projectRoot);
     const projectDir = path.join(os.homedir(), ".deepcode", "projects", projectCode);
     const sessionsIndexPath = path.join(projectDir, "sessions-index.json");
     return { projectCode, projectDir, sessionsIndexPath };
@@ -1604,6 +1889,10 @@ ${skillMd}
 
   private getCurrentCheckpointHash(sessionId: string): string | undefined {
     return this.getFileHistory().getCurrentCheckpointHash(sessionId);
+  }
+
+  private recordUserPromptCheckpoint(sessionId: string): FileHistoryCheckpointResult {
+    return this.getFileHistory().recordTrackedFilesCheckpoint(sessionId, "User prompt checkpoint");
   }
 
   private prepareFileMutationCheckpoint(sessionId: string, filePath: string): void {
@@ -1719,6 +2008,32 @@ ${skillMd}
     }
   }
 
+  private cleanupSessionResources(
+    sessionId: string,
+    options: { removeMessages: boolean; processIds?: number[] }
+  ): void {
+    const processIds = options.processIds ?? [];
+    for (const pid of processIds) {
+      const processControlKey = this.getProcessControlKey(sessionId, pid);
+      if (!this.processTimeoutControls.has(processControlKey) && !this.liveProcessKeys.has(processControlKey)) {
+        continue;
+      }
+
+      this.killTrackedProcess(processControlKey, pid);
+    }
+
+    clearSessionState(sessionId);
+    clearSessionWorkingDir(sessionId);
+    const controller = this.sessionControllers.get(sessionId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort();
+    }
+    this.sessionControllers.delete(sessionId);
+    if (options.removeMessages) {
+      this.removeSessionMessages([sessionId]);
+    }
+  }
+
   private appendSessionMessage(sessionId: string, message: SessionMessage): void {
     this.ensureProjectDir();
     const messagePath = this.getSessionMessagesPath(sessionId);
@@ -1767,6 +2082,7 @@ ${skillMd}
       visible: true,
       createTime: now,
       updateTime: now,
+      meta: { userPrompt: this.cloneUserPromptForMeta(prompt) },
       checkpointHash: this.getCurrentCheckpointHash(sessionId),
     };
   }
@@ -1956,16 +2272,40 @@ ${skillMd}
     };
   }
 
-  private async appendToolMessages(sessionId: string, toolCalls: unknown[]): Promise<{ waitingForUser: boolean }> {
-    const toolExecutions = await this.toolExecutor.executeToolCalls(sessionId, toolCalls, {
+  private async appendToolMessages(
+    sessionId: string,
+    toolCalls: unknown[],
+    options: {
+      permissionOverrides?: UserToolPermission[];
+      messagePermissions?: MessageToolPermission[];
+    } = {}
+  ): Promise<{ waitingForUser: boolean }> {
+    const hooks: ToolExecutionHooks = {
       onProcessStart: (pid, command) => this.addSessionProcess(sessionId, pid, command),
       onProcessExit: (pid) => this.removeSessionProcess(sessionId, pid),
       onProcessStdout: (pid, chunk) => this.onProcessStdout?.(Number(pid), chunk),
       onProcessTimeoutControl: (pid, control) => this.setSessionProcessTimeoutControl(sessionId, pid, control),
+      onBackgroundProcessComplete: (completion) => this.addBackgroundProcessCompletionMessage(sessionId, completion),
       onBeforeFileMutation: (filePath) => this.prepareFileMutationCheckpoint(sessionId, filePath),
       onAfterFileMutation: (filePath) => this.recordFileMutationCheckpoint(sessionId, filePath),
       shouldStop: () => this.isInterrupted(sessionId),
-    });
+    };
+    const parsedToolCalls = toolCalls
+      .map((toolCall) => parseToolCallForPermissions(toolCall))
+      .filter((toolCall): toolCall is PermissionToolCall => Boolean(toolCall));
+    const toolExecutions: ToolCallExecution[] = [];
+    for (const toolCall of parsedToolCalls) {
+      if (hooks.shouldStop?.()) {
+        break;
+      }
+      const blockedResult = buildPermissionToolExecution(toolCall, options);
+      if (blockedResult) {
+        toolExecutions.push(blockedResult);
+        continue;
+      }
+      const executions = await this.toolExecutor.executeToolCalls(sessionId, [toolCall], hooks);
+      toolExecutions.push(...executions);
+    }
     if (this.isInterrupted(sessionId)) {
       return { waitingForUser: false };
     }
@@ -1975,7 +2315,7 @@ ${skillMd}
       if (execution.result.awaitUserResponse === true) {
         waitingForUser = true;
       }
-      const toolFunction = this.findToolFunction(toolCalls, execution.toolCallId);
+      const toolFunction = this.messageConverter.findToolFunction(toolCalls, execution.toolCallId);
       const toolMessage = this.buildToolMessage(sessionId, execution.toolCallId, execution.content, toolFunction);
       this.appendSessionMessage(sessionId, toolMessage);
       this.onAssistantMessage(toolMessage, true);
@@ -1996,234 +2336,57 @@ ${skillMd}
     return { waitingForUser };
   }
 
-  private buildOpenAIMessages(
-    messages: SessionMessage[],
-    thinkingEnabled: boolean,
-    model: string
-  ): ChatCompletionMessageParam[] {
-    const activeMessages = messages.filter((message) => !message.compacted);
-    const toolPairings = this.pairToolMessages(activeMessages);
-    const openAIMessages: ChatCompletionMessageParam[] = [];
-
-    for (let index = 0; index < activeMessages.length; index += 1) {
-      const message = activeMessages[index];
-      if (message.role === "tool") {
-        continue;
-      }
-
-      openAIMessages.push(this.sessionMessageToOpenAIMessage(message, thinkingEnabled, model));
-
-      const toolCalls = this.getAssistantToolCalls(message);
-      if (toolCalls.length === 0) {
-        continue;
-      }
-
-      for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex += 1) {
-        const toolCallId = this.getToolCallId(toolCalls[toolCallIndex]);
-        if (!toolCallId) {
-          continue;
-        }
-
-        const pairedToolIndex = toolPairings.get(this.buildToolPairingKey(index, toolCallIndex));
-        if (pairedToolIndex != null) {
-          openAIMessages.push(
-            this.sessionMessageToOpenAIMessage(activeMessages[pairedToolIndex], thinkingEnabled, model)
-          );
-          continue;
-        }
-
-        openAIMessages.push(this.buildInterruptedOpenAIToolMessage(toolCalls, toolCallId));
-      }
-    }
-
-    return openAIMessages;
-  }
-
-  private sessionMessageToOpenAIMessage(
-    message: SessionMessage,
-    thinkingEnabled: boolean,
-    model: string
-  ): ChatCompletionMessageParam {
-    const content = this.renderOpenAIMessageContent(message);
-    const base: ChatCompletionMessageParam = {
-      role: message.role,
-      content,
-    } as ChatCompletionMessageParam;
-
-    const messageParams = message.messageParams as
-      | { tool_calls?: unknown[]; tool_call_id?: string; reasoning_content?: string }
-      | null
-      | undefined;
-    if (messageParams?.tool_calls) {
-      (base as { tool_calls?: unknown[] }).tool_calls = messageParams.tool_calls;
-    }
-    if (messageParams?.tool_call_id) {
-      (base as { tool_call_id?: string }).tool_call_id = messageParams.tool_call_id;
-    }
-    if (typeof messageParams?.reasoning_content === "string") {
-      (base as { reasoning_content?: string }).reasoning_content = messageParams.reasoning_content;
-    } else if (thinkingEnabled && message.role === "assistant") {
-      // Thinking-mode providers require every replayed assistant message
-      // to include the reasoning_content field, even when it is empty.
-      (base as { reasoning_content?: string }).reasoning_content = "";
-    }
-
-    if ((message.role === "user" || message.role === "system") && message.contentParams) {
-      const contentParts: ChatCompletionContentPart[] = [];
-      if (content) {
-        contentParts.push({ type: "text", text: content });
-      }
-      const params = Array.isArray(message.contentParams) ? message.contentParams : [message.contentParams];
-      for (const param of params) {
-        const part = param as ChatCompletionContentPart;
-        if (part && (part.type !== "image_url" || supportsMultimodal(model))) {
-          contentParts.push(part);
-        }
-      }
-      const contentValue: string | ChatCompletionContentPart[] = contentParts.length > 0 ? contentParts : content;
-      (base as { content: string | ChatCompletionContentPart[] }).content = contentValue;
-    }
-
-    return base;
-  }
-
-  private renderOpenAIMessageContent(message: SessionMessage): string {
-    if (message.role === "user" && message.content === "/init") {
-      return this.renderInitCommandPrompt();
-    }
-    return message.content ?? "";
-  }
-
-  private pairToolMessages(messages: SessionMessage[]): Map<string, number> {
-    const pairings = new Map<string, number>();
-    const usedToolMessageIndexes = new Set<number>();
-
-    for (let assistantIndex = 0; assistantIndex < messages.length; assistantIndex += 1) {
-      const toolCalls = this.getAssistantToolCalls(messages[assistantIndex]);
-      for (let toolCallIndex = 0; toolCallIndex < toolCalls.length; toolCallIndex += 1) {
-        const toolCallId = this.getToolCallId(toolCalls[toolCallIndex]);
-        if (!toolCallId) {
-          continue;
-        }
-
-        const toolIndex = this.findPairableToolMessageIndex(
-          messages,
-          assistantIndex,
-          toolCallId,
-          usedToolMessageIndexes
-        );
-        if (toolIndex == null) {
-          continue;
-        }
-
-        usedToolMessageIndexes.add(toolIndex);
-        pairings.set(this.buildToolPairingKey(assistantIndex, toolCallIndex), toolIndex);
-      }
-    }
-
-    return pairings;
-  }
-
-  private getTrailingPendingToolCalls(messages: SessionMessage[]): unknown[] {
-    const activeMessages = messages.filter((message) => !message.compacted);
-    const latestMessage = activeMessages[activeMessages.length - 1];
-    if (!latestMessage || latestMessage.role !== "assistant") {
-      return [];
-    }
-
-    const toolCalls = this.getAssistantToolCalls(latestMessage);
-    if (toolCalls.length === 0) {
-      return [];
-    }
-    return toolCalls.filter((toolCall) => Boolean(this.getToolCallId(toolCall)));
-  }
-
-  private findPairableToolMessageIndex(
-    messages: SessionMessage[],
-    assistantIndex: number,
-    toolCallId: string,
-    usedToolMessageIndexes: Set<number>
-  ): number | null {
-    let firstMatchingIndex: number | null = null;
-    for (let index = assistantIndex + 1; index < messages.length; index += 1) {
-      const message = messages[index];
-      if (message.role !== "tool" || usedToolMessageIndexes.has(index)) {
-        continue;
-      }
-
-      const candidateToolCallId = this.getToolMessageCallId(message);
-      if (candidateToolCallId !== toolCallId) {
-        continue;
-      }
-
-      if (firstMatchingIndex == null) {
-        firstMatchingIndex = index;
-      }
-      if (!this.isInterruptedToolMessage(message)) {
-        return index;
-      }
-    }
-    return firstMatchingIndex;
-  }
-
-  private getAssistantToolCalls(message: SessionMessage): unknown[] {
-    if (message.role !== "assistant") {
-      return [];
-    }
-    const messageParams = message.messageParams as { tool_calls?: unknown[] } | null;
-    return Array.isArray(messageParams?.tool_calls) ? messageParams.tool_calls : [];
-  }
-
-  private getToolCallId(toolCall: unknown): string | null {
-    if (!toolCall || typeof toolCall !== "object") {
-      return null;
-    }
-    const id = (toolCall as { id?: unknown }).id;
-    return typeof id === "string" && id ? id : null;
-  }
-
-  private getToolMessageCallId(message: SessionMessage): string | null {
-    const messageParams = message.messageParams as { tool_call_id?: unknown } | null;
-    const toolCallId = messageParams?.tool_call_id;
-    return typeof toolCallId === "string" && toolCallId ? toolCallId : null;
-  }
-
-  private buildToolPairingKey(assistantIndex: number, toolCallIndex: number): string {
-    return `${assistantIndex}:${toolCallIndex}`;
-  }
-
-  private isInterruptedToolMessage(message: SessionMessage): boolean {
-    if (typeof message.content !== "string" || !message.content.trim()) {
-      return false;
-    }
-    try {
-      const parsed = JSON.parse(message.content) as { metadata?: { interrupted?: unknown } };
-      return parsed.metadata?.interrupted === true;
-    } catch {
-      return false;
-    }
-  }
-
-  private buildInterruptedOpenAIToolMessage(toolCalls: unknown[], toolCallId: string): ChatCompletionMessageParam {
-    const toolFunction = this.findToolFunction(toolCalls, toolCallId);
+  private cloneUserPromptForMeta(prompt: UserPromptContent): UserPromptContent {
     return {
-      role: "tool",
-      content: this.buildInterruptedToolResult(toolFunction, "Previous tool call did not complete."),
-      tool_call_id: toolCallId,
-    } as ChatCompletionMessageParam;
+      text: prompt.text,
+      imageUrls: prompt.imageUrls ? [...prompt.imageUrls] : undefined,
+      skills: prompt.skills ? prompt.skills.map((skill) => ({ ...skill })) : undefined,
+      permissions: prompt.permissions ? prompt.permissions.map((permission) => ({ ...permission })) : undefined,
+      alwaysAllows: prompt.alwaysAllows ? [...prompt.alwaysAllows] : undefined,
+    };
   }
 
-  private findToolFunction(toolCalls: unknown[], toolCallId: string): unknown | null {
-    for (const toolCall of toolCalls) {
-      if (!toolCall || typeof toolCall !== "object") {
-        continue;
-      }
-      const record = toolCall as { id?: unknown; function?: unknown };
-      if (record.id === toolCallId) {
-        return record.function ?? null;
+  private hasTrailingPendingToolCalls(sessionId: string): boolean {
+    return (
+      this.messageConverter.getTrailingPendingToolCallMessage(this.listSessionMessages(sessionId)).toolCalls.length > 0
+    );
+  }
+
+  private async appendDeferredPermissionPrompt(
+    sessionId: string,
+    userPrompt: UserPromptContent | undefined,
+    controller: AbortController
+  ): Promise<void> {
+    if (!userPrompt || this.isContinuePrompt(userPrompt)) {
+      return;
+    }
+    const text = userPrompt.text ?? "";
+    const hasUserContent =
+      text.trim().length > 0 ||
+      (Array.isArray(userPrompt.imageUrls) && userPrompt.imageUrls.length > 0) ||
+      (Array.isArray(userPrompt.skills) && userPrompt.skills.length > 0);
+    if (!hasUserContent) {
+      return;
+    }
+    this.reportNewPrompt();
+    const signal = controller.signal;
+    const userMessage = this.buildUserMessage(sessionId, userPrompt);
+    this.appendSessionMessage(sessionId, userMessage);
+    if (userPrompt.text) {
+      const skills = await this.listSkills(sessionId);
+      const skillNames = await this.identifyMatchingSkillNames(skills, userPrompt.text, { signal, sessionId });
+      this.throwIfAborted(signal);
+      const skillSet = new Set(skillNames);
+      const matchedSkill = skills.filter((skill) => skillSet.has(skill.name));
+      if (Array.isArray(userPrompt.skills)) {
+        userPrompt.skills.push(...matchedSkill);
+      } else if (matchedSkill.length > 0) {
+        userPrompt.skills = matchedSkill;
       }
     }
-    return null;
+    userPrompt.skills = await this.normalizeSkills(userPrompt.skills, sessionId);
+    this.throwIfAborted(signal);
+    this.appendSkillMessages(sessionId, userPrompt.skills);
   }
 
   private buildToolParamsSnippet(toolFunction: unknown | null): string {
@@ -2270,6 +2433,12 @@ ${skillMd}
       return typeof args.explanation === "string" ? args.explanation.trim() : "";
     } else if (toolName === "write") {
       return typeof args.file_path === "string" ? args.file_path.trim() : "";
+    } else if (toolName === "edit") {
+      const filePath = typeof args.file_path === "string" ? args.file_path.trim() : "";
+      if (filePath) {
+        return filePath;
+      }
+      return typeof args.snippet_id === "string" ? args.snippet_id.trim() : "";
     }
 
     const firstKey = Object.keys(args)[0];
@@ -2363,6 +2532,7 @@ ${skillMd}
 
   private addSessionProcess(sessionId: string, processId: string | number, command: string): void {
     const now = new Date().toISOString();
+    this.liveProcessKeys.add(this.getProcessControlKey(sessionId, processId));
     this.updateSessionEntry(sessionId, (entry) => {
       const processes = new Map(entry.processes ?? []);
       processes.set(String(processId), { startTime: now, command });
@@ -2374,9 +2544,86 @@ ${skillMd}
     });
   }
 
+  private addBackgroundProcessCompletionMessage(
+    sessionId: string,
+    completion: {
+      command: string;
+      outputPath: string;
+      ok: boolean;
+      exitCode: number | null;
+      signal: string | null;
+      error?: string;
+      completedAtMs: number;
+      startedAtMs: number;
+    }
+  ): void {
+    const status = completion.ok ? "completed" : "failed";
+    const exitText =
+      completion.exitCode !== null
+        ? `exit code ${completion.exitCode}`
+        : completion.signal
+          ? `signal ${completion.signal}`
+          : completion.error || "unknown status";
+    const durationMs = Math.max(0, completion.completedAtMs - completion.startedAtMs);
+    const baseContent =
+      `Background command "${completion.command}" ${status} with ${exitText} ` +
+      `after ${this.formatBackgroundDuration(durationMs)}. Output: ${completion.outputPath}`;
+    const logTail = completion.ok ? null : this.buildBackgroundFailureLogTailSlice(completion.outputPath);
+    const content = logTail ? `${baseContent}\n${logTail}` : baseContent;
+    this.addSessionSystemMessage(sessionId, content, true);
+  }
+
+  private buildBackgroundFailureLogTailSlice(outputPath: string): string | null {
+    const tail = this.readTextFileTail(outputPath, BACKGROUND_FAILURE_LOG_TAIL_CHARS);
+    if (!tail || !tail.content) {
+      return null;
+    }
+    const prefix = tail.truncated ? `(${tail.totalBytes} bytes)...\n` : "";
+    return [
+      `<background_task_failure_log path="${outputPath}">`,
+      `${prefix}${tail.content}`,
+      "</background_task_failure_log>",
+    ].join("\n");
+  }
+
+  private readTextFileTail(
+    filePath: string,
+    maxChars: number
+  ): { content: string; totalBytes: number; truncated: boolean } | null {
+    try {
+      const stat = fs.statSync(filePath);
+      if (!stat.isFile() || stat.size <= 0) {
+        return null;
+      }
+      const content = readTextFileWithMetadata(filePath).content;
+      return {
+        content: content.slice(-maxChars).trimEnd(),
+        totalBytes: stat.size,
+        truncated: content.length > maxChars,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private formatBackgroundDuration(durationMs: number): string {
+    if (durationMs < 1000) {
+      return `${durationMs}ms`;
+    }
+    const seconds = Math.round(durationMs / 1000);
+    if (seconds < 60) {
+      return `${seconds}s`;
+    }
+    const minutes = Math.floor(seconds / 60);
+    const remainingSeconds = seconds % 60;
+    return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+  }
+
   private removeSessionProcess(sessionId: string, processId: string | number): void {
     const now = new Date().toISOString();
-    this.processTimeoutControls.delete(this.getProcessControlKey(sessionId, processId));
+    const processControlKey = this.getProcessControlKey(sessionId, processId);
+    this.processTimeoutControls.delete(processControlKey);
+    this.liveProcessKeys.delete(processControlKey);
     this.updateSessionEntry(sessionId, (entry) => {
       const processes = new Map(entry.processes ?? []);
       processes.delete(String(processId));
@@ -2439,6 +2686,37 @@ ${skillMd}
     return `${sessionId}:${String(processId)}`;
   }
 
+  private killLiveProcesses(): void {
+    for (const processControlKey of Array.from(this.liveProcessKeys)) {
+      const processId = this.getProcessIdFromControlKey(processControlKey);
+      if (processId === null) {
+        this.liveProcessKeys.delete(processControlKey);
+        continue;
+      }
+      this.killTrackedProcess(processControlKey, processId);
+    }
+  }
+
+  private killTrackedProcess(processControlKey: string, processId: number): void {
+    const killedGroup = killProcessTree(processId, "SIGKILL");
+    if (!killedGroup) {
+      try {
+        process.kill(processId, "SIGKILL");
+      } catch {
+        // Ignore process-kill failures during cleanup.
+      }
+    }
+    this.processTimeoutControls.delete(processControlKey);
+    this.liveProcessKeys.delete(processControlKey);
+  }
+
+  private getProcessIdFromControlKey(processControlKey: string): number | null {
+    const separatorIndex = processControlKey.lastIndexOf(":");
+    const rawProcessId = separatorIndex >= 0 ? processControlKey.slice(separatorIndex + 1) : processControlKey;
+    const processId = Number(rawProcessId);
+    return Number.isInteger(processId) && processId > 0 ? processId : null;
+  }
+
   private getProcessIds(processes: Map<string, SessionProcessEntry> | null): number[] {
     if (!processes) {
       return [];
@@ -2451,25 +2729,6 @@ ${skillMd}
       }
     }
     return ids;
-  }
-
-  private buildInterruptedToolResult(toolFunction: unknown | null, reason: string): string {
-    const toolName =
-      toolFunction && typeof toolFunction === "object" && typeof (toolFunction as { name?: unknown }).name === "string"
-        ? (toolFunction as { name: string }).name
-        : "tool";
-    return JSON.stringify(
-      {
-        ok: false,
-        name: toolName,
-        error: reason,
-        metadata: {
-          interrupted: true,
-        },
-      },
-      null,
-      2
-    );
   }
 
   private normalizeSessionEntry(entry: unknown): SessionEntry {
@@ -2489,6 +2748,7 @@ ${skillMd}
       createTime: typeof value.createTime === "string" ? value.createTime : new Date().toISOString(),
       updateTime: typeof value.updateTime === "string" ? value.updateTime : new Date().toISOString(),
       processes: this.deserializeProcesses(value.processes),
+      askPermissions: normalizeAskPermissions(value.askPermissions),
     };
   }
 
@@ -2499,7 +2759,9 @@ ${skillMd}
       status === "processing" ||
       status === "waiting_for_user" ||
       status === "completed" ||
-      status === "interrupted"
+      status === "interrupted" ||
+      status === "ask_permission" ||
+      status === "permission_denied"
     ) {
       return status;
     }
